@@ -154,7 +154,6 @@ Runtime configuration is stored in:
 backend/config.json
 ```
 
-This file is intentionally ignored by Git because it can contain local provider URLs and API keys.
 
 Important settings include:
 
