@@ -1,0 +1,21 @@
+# Python package dependencies for the backend server.
+# After installing these, also run:
+#   playwright install chromium
+#
+# Optional system dependency:
+# - Tesseract OCR binary is required for OCR features used via pytesseract.
+#   On Windows, set TESSERACT_CMD if the binary is not auto-detected.
+# - On Linux, desktop app control works best with: xdotool, wmctrl, and either
+#   gnome-screenshot or scrot for desktop screenshots when Pillow cannot grab
+#   the screen directly.
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+playwright>=1.48.0
+httpx>=0.27.2
+python-multipart>=0.0.12
+greenlet>=3.1.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+pymupdf>=1.24.0
+PyYAML>=6.0.2
