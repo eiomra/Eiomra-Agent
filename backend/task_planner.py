@@ -354,6 +354,10 @@ For local workspace / computer actions:
 - zip_paths        → {"thought":"...","action":"zip_paths","sources":["reports","notes.txt"],"destination":"artifacts/bundle.zip","summary":"..."}
 - run_command      → {"thought":"...","action":"run_command","command":"npm test","cwd":"frontend","summary":"..."}
 
+FILE CONTENT RULE: When the user asks for a summary, report, notes, or any generated file, the `content`
+must synthesize the real findings already gathered in this task. Never write placeholder text, a restatement
+of the file instruction, or a generic summary that ignores completed-task findings and recent action results.
+
 To mark the CURRENT task as complete (when you have found/done what it requires):
 {"thought":"...","action":"complete_task","task_id":"the_task_id","finding":"exact data or confirmation found","summary":"..."}
 
@@ -492,6 +496,12 @@ def build_execution_prompt(tracker: TaskTracker, context: dict,
         f"  Step {i+1}: {h['action']} => {h['result']}"
         for i, h in enumerate(history[-12:])
     ])
+    completed_findings = "\n".join(
+        f"  - {task.description}: {task.finding}"
+        for task in tracker.tasks
+        if task.status == "completed" and task.finding
+    )
+    accumulated_knowledge = completed_findings or "  (No completed-task findings yet; use relevant recent results below.)"
     char_info = (f"[Page: {context.get('char_count',0)} chars | "
                  f"DOM={context.get('sources',{}).get('dom_chars',0)} "
                  f"OCR={context.get('sources',{}).get('ocr_chars',0)} "
@@ -562,6 +572,9 @@ Start with #1. If #1 has "ALREADY TRIED" mark, skip it and use #2 or #3.
     return f"""GOAL: {tracker.goal}
 
 {tracker.status_block()}
+
+ACCUMULATED TASK KNOWLEDGE (use this as source material for any file/report content):
+{accumulated_knowledge}
 {stuck}
 CURRENT PAGE:
 URL: {context.get('url','about:blank')}
@@ -609,7 +622,10 @@ def build_report_prompt(tracker: TaskTracker, history: list, artifact_context: s
         f"Task Completion ({tracker.completed_count}/{tracker.total_count}):\n{task_summary}\n\n"
         f"Session actions:\n{hist}\n\n"
         f"{artifact_block}"
-        "Write a complete final report. Lead with the key findings from completed tasks. "
+        "Write the authoritative, complete version of the requested deliverable. "
+        "Any user-requested summary, findings, notes, or report file will be synchronized "
+        "to this final report after generation. Do not call that file merely concise and "
+        "do not claim an exact character or word count. Lead with the key findings from completed tasks. "
         "Present data clearly (numbers, lists, specific details). "
         "Note any tasks that could not be completed and why. "
         "If saved artifact contents are provided, keep the report aligned with that content "

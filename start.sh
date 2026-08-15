@@ -60,7 +60,7 @@ install_frontend_deps() {
 }
 
 echo "============================================"
-echo "  AI Browser Agent - Linux Setup & Run"
+echo "  Eiomra Agent - Linux Setup & Run"
 echo "============================================"
 echo
 

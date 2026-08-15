@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   AI Browser Agent - Setup & Run
+echo   Eiomra Agent - Setup & Run
 echo ============================================
 echo.
 
@@ -45,9 +45,9 @@ echo.
 echo [4/4] Starting services...
 echo.
 
-start "AI Browser - Backend" cmd /k "cd /d %~dp0backend && python agent.py"
+start "Eiomra Agent - Backend" cmd /k "cd /d %~dp0backend && python agent.py"
 timeout /t 3 /nobreak >nul
-start "AI Browser - Frontend" cmd /k "cd /d %~dp0frontend && npm run dev"
+start "Eiomra Agent - Frontend" cmd /k "cd /d %~dp0frontend && npm run dev"
 timeout /t 4 /nobreak >nul
 start http://localhost:3000
 

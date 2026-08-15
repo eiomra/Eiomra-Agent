@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import "./App.css";
+import NexusShell from "./NexusShell.jsx";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8765";
 const WS_URL = import.meta.env.VITE_WS_URL || `${API.replace(/^http/i, "ws")}/ws`;
@@ -106,6 +108,21 @@ function SettingsPanel({onClose}){
             Order: {cfg.fallback_order.join(" → ")}
           </div>
         )}
+
+        {sec("Ollama request queue","#8b5cf6")}
+        {tog(cfg.ollama_queue_enabled!==false,v=>setCfg(c=>({...c,ollama_queue_enabled:v})),
+          "Queue and pace Ollama requests",
+          <>
+            {row("Minimum delay between requests",
+              <><div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{cfg.ollama_queue_min_interval_seconds??6}s</div>
+              {sldr(cfg.ollama_queue_min_interval_seconds??6,v=>setCfg(c=>({...c,ollama_queue_min_interval_seconds:v})),0,30,1,["0s","6s","15s","30s"])}</>)}
+            {row("Rate-limit retries",
+              <><div style={{fontSize:11,color:"#64748b",marginBottom:4}}>{cfg.ollama_queue_max_retries??3} retries</div>
+              {sldr(cfg.ollama_queue_max_retries??3,v=>setCfg(c=>({...c,ollama_queue_max_retries:v})),0,6,1,["0","2","4","6"])}</>)}
+          </>
+        )}
+        {tog(cfg.resume_incomplete_on_startup!==false,v=>setCfg(c=>({...c,resume_incomplete_on_startup:v})),
+          "Resume interrupted bot tasks when the server starts")}
 
         <div style={{height:1,background:"#1a1f2e",margin:"14px 0"}}/>
         {sec("🔄 Adaptive Replanning","#06b6d4")}
@@ -394,6 +411,12 @@ function ProfilesPanel({onClose}){
   const [newName,  setNewName]    = useState("");
   const [msg,      setMsg]        = useState("");
   const [loading,  setLoading]    = useState(false);
+  const [sources,  setSources]    = useState([]);
+  const [sourceId, setSourceId]   = useState("");
+  const [importName,setImportName]= useState("");
+  const [overwrite,setOverwrite]  = useState(false);
+  const [useAfter,setUseAfter]    = useState(true);
+  const [importing,setImporting]  = useState(false);
 
   const load = async () => {
     const r = await fetch(`${API}/profiles`);
@@ -401,9 +424,29 @@ function ProfilesPanel({onClose}){
     setProfiles(d.profiles || []);
   };
 
-  useEffect(()=>{ load(); }, []);
+  const loadSources = async () => {
+    const r = await fetch(`${API}/profiles/sources`);
+    const d = await r.json();
+    const detected = d.sources || [];
+    setSources(detected);
+    const firstCompatible = detected.find(s=>s.compatible);
+    if (!sourceId && firstCompatible) {
+      setSourceId(firstCompatible.id);
+      setImportName(firstCompatible.recommended_name || "");
+    }
+  };
+
+  useEffect(()=>{ load(); loadSources(); }, []);
 
   const flash = (m) => { setMsg(m); setTimeout(()=>setMsg(""), 3500); };
+
+  const selectedSource = sources.find(s=>s.id===sourceId);
+
+  const chooseSource = (id) => {
+    setSourceId(id);
+    const src = sources.find(s=>s.id===id);
+    if (src) setImportName(src.recommended_name || "");
+  };
 
   const switchProfile = async (name) => {
     setLoading(true);
@@ -436,6 +479,32 @@ function ProfilesPanel({onClose}){
     load();
   };
 
+  const importProfile = async () => {
+    if (!selectedSource?.compatible || !importName.trim()) return;
+    if (overwrite && !window.confirm(`Overwrite project profile "${importName.trim()}"?`)) return;
+    setImporting(true);
+    try {
+      const r = await fetch(`${API}/profiles/import`, {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          source_id: sourceId,
+          target_name: importName.trim(),
+          overwrite,
+          use_after_import: useAfter,
+        })
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || d.error || "Import failed");
+      flash(`Imported "${d.name}" (${d.copied_files} files). Restart backend to use it.`);
+      load();
+      loadSources();
+    } catch (e) {
+      flash(e.message || "Import failed");
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <Modal onClose={onClose} title="🗂 Browser Profiles & Sessions" width={560}>
       <div style={{padding:"14px 20px", overflowY:"auto", maxHeight:"75vh"}}>
@@ -458,6 +527,74 @@ function ProfilesPanel({onClose}){
             {msg}
           </div>
         )}
+
+        {/* Import local browser profile */}
+        <div style={{marginBottom:18,padding:"10px 12px",background:"#0a0c12",
+          border:"1px solid #1a1f2e",borderRadius:7}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+            <label style={{fontSize:9,color:"#f97316",textTransform:"uppercase",letterSpacing:1,flex:1}}>
+              IMPORT FROM THIS COMPUTER
+            </label>
+            <button onClick={loadSources} disabled={importing}
+              style={{padding:"4px 9px",borderRadius:4,border:"1px solid #2d3748",
+                background:"#111827",color:"#94a3b8",cursor:"pointer",fontSize:10,fontFamily:"inherit"}}>
+              Refresh
+            </button>
+          </div>
+          <div style={{fontSize:10,color:"#64748b",lineHeight:1.6,marginBottom:8}}>
+            Chrome, Edge, Brave, Chromium, Vivaldi and Opera profiles can be copied into a project profile.
+            Close the source browser first for the best chance of bringing cookies and logged-in sessions across.
+            Firefox and Safari are detected for visibility, but cannot be used directly by this Chromium-based agent.
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1.4fr 1fr auto",gap:8,alignItems:"end"}}>
+            <div>
+              <label style={{fontSize:8,color:"#374151",textTransform:"uppercase",letterSpacing:1}}>Source</label>
+              <select value={sourceId} onChange={e=>chooseSource(e.target.value)}
+                style={{marginTop:4,width:"100%",background:"#05070b",border:"1px solid #1a1f2e",
+                  borderRadius:5,color:"#e2e8f0",padding:"6px 8px",fontSize:10.5,outline:"none"}}>
+                {sources.length===0&&<option value="">No local profiles detected</option>}
+                {sources.map(s=>(
+                  <option key={s.id} value={s.id}>
+                    {s.browser} / {s.profile} {s.compatible ? "" : "(not compatible)"}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label style={{fontSize:8,color:"#374151",textTransform:"uppercase",letterSpacing:1}}>Project profile name</label>
+              <input value={importName} onChange={e=>setImportName(e.target.value)}
+                placeholder="e.g. chrome_work"
+                style={{marginTop:4,width:"100%",background:"#05070b",border:"1px solid #1a1f2e",
+                  borderRadius:5,color:"#e2e8f0",padding:"6px 8px",fontSize:10.5,outline:"none",
+                  fontFamily:"inherit"}}/>
+            </div>
+            <button onClick={importProfile}
+              disabled={!selectedSource?.compatible||!importName.trim()||importing}
+              style={{padding:"7px 12px",borderRadius:5,border:"none",
+                background:selectedSource?.compatible&&importName.trim()&&!importing?"#f97316":"#1a1f2e",
+                color:"white",cursor:selectedSource?.compatible&&importName.trim()&&!importing?"pointer":"not-allowed",
+                fontSize:10.5,fontWeight:700,fontFamily:"inherit"}}>
+              {importing?"Importing...":"Import"}
+            </button>
+          </div>
+          {selectedSource&&(
+            <div style={{marginTop:7,fontSize:9.5,color:selectedSource.compatible?"#94a3b8":"#f59e0b",
+              wordBreak:"break-all",lineHeight:1.5}}>
+              {selectedSource.note}<br/>
+              {selectedSource.path}
+            </div>
+          )}
+          <div style={{display:"flex",gap:14,marginTop:8,flexWrap:"wrap"}}>
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:10,color:"#64748b",cursor:"pointer"}}>
+              <input type="checkbox" checked={useAfter} onChange={e=>setUseAfter(e.target.checked)}/>
+              Use after import
+            </label>
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:10,color:"#64748b",cursor:"pointer"}}>
+              <input type="checkbox" checked={overwrite} onChange={e=>setOverwrite(e.target.checked)}/>
+              Overwrite existing target
+            </label>
+          </div>
+        </div>
 
         {/* Profile list */}
         <div style={{marginBottom:18}}>
@@ -645,7 +782,7 @@ function FileBrowser({title,listUrl,fetchBase,onClose}){
 }
 
 /* ── Live Log ─────────────────────────────────────────────────────────────── */
-function LiveLog({isRunning}){
+function LiveLog({isRunning,commandEvents=[]}){
   const [content,setCon]=useState("(no active session)");
   const [filename,setFn]=useState("");
   const [autoScroll,setAs]=useState(true);
@@ -660,7 +797,7 @@ function LiveLog({isRunning}){
     };
     poll(); const id=setInterval(poll,700); return()=>clearInterval(id);
   },[isRunning]);
-  useEffect(()=>{if(autoScroll&&ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[content,autoScroll]);
+  useEffect(()=>{if(autoScroll&&ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[content,commandEvents,autoScroll]);
   const col=l=>{
     if(l.includes("════"))return"#1e293b";
     if(l.includes("SESSION"))return"#6366f1";
@@ -707,6 +844,21 @@ function LiveLog({isRunning}){
         {content.split("\n").map((l,i)=>(
           <div key={i} style={{color:col(l),whiteSpace:"pre"}}>{l||"\u00a0"}</div>
         ))}
+        {commandEvents.length>0&&(
+          <div style={{marginTop:10,border:"1px solid #1a1f2e",borderRadius:5,
+            background:"#030712",overflow:"hidden"}}>
+            <div style={{padding:"4px 8px",borderBottom:"1px solid #1a1f2e",
+              color:"#f97316",fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>
+              Terminal Output
+            </div>
+            <div style={{maxHeight:220,overflow:"auto",padding:"5px 8px"}}>
+              {commandEvents.slice(-160).map((e,i)=>(
+                <div key={i} style={{color:e.kind==="stderr"?"#f87171":e.kind==="meta"?"#f59e0b":"#94a3b8",
+                  whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{e.text||"\u00a0"}</div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -717,7 +869,8 @@ function LogEntry({entry}){
   const colors={start:"#6366f1",done:"#22c55e",error:"#ef4444",thinking:"#f59e0b",
     decision:"#3b82f6",info:"#374151",warning:"#f97316",
     task_done:"#22c55e",task_skip:"#6b7280",plan:"#06b6d4",
-    planning:"#f59e0b",inject:"#f97316",replan:"#06b6d4",auto:"#22c55e"};
+    planning:"#f59e0b",inject:"#f97316",replan:"#06b6d4",auto:"#22c55e",
+    command:"#f97316"};
   const color=colors[entry.kind]||"#374151";
   if(entry.kind==="decision") return(
     <div style={{background:`${color}07`,border:`1px solid ${color}18`,borderRadius:4,padding:"3px 6px"}}>
@@ -784,31 +937,103 @@ export default function App(){
   const [showProfiles,setShowProfiles]=useState(false);
   const [attachments,setAttachments]=useState([]);
   const [configLoaded,setConfigLoaded]=useState(false);
+  const [commandEvents,setCommandEvents]=useState([]);
+  const [pageView,setPageView]=useState("home");
+  const [controlOwner,setControlOwner]=useState("agent");
+  const [computerBusy,setComputerBusy]=useState(false);
+  const [computerMessage,setComputerMessage]=useState("");
+  const [operatorText,setOperatorText]=useState("");
+  const [activityFilter,setActivityFilter]=useState("all");
+  const [mobileNav,setMobileNav]=useState(false);
+  const [startError,setStartError]=useState("");
+  const [bots,setBots]=useState([{id:"primary",name:"Primary Browser Agent",role:"Web research, local files, desktop tools, and execution"}]);
+  const [selectedBotId,setSelectedBotId]=useState("primary");
 
   const wsRef=useRef(null); const logRef=useRef(null); const fileInputRef=useRef(null);
   const goalRef=useRef(goal); const provRef=useRef(provider); const modRef=useRef(model);
   const attachmentsRef=useRef(attachments);
+  const selectedBotRef=useRef(selectedBotId);
+  const wheelTimerRef=useRef(null); const wheelDeltaRef=useRef(0);
   useEffect(()=>{goalRef.current=goal;},[goal]);
   useEffect(()=>{provRef.current=provider;},[provider]);
   useEffect(()=>{modRef.current=model;},[model]);
   useEffect(()=>{attachmentsRef.current=attachments;},[attachments]);
+  useEffect(()=>{selectedBotRef.current=selectedBotId;},[selectedBotId]);
 
   const addLog=useCallback(e=>setLog(prev=>[...prev.slice(-300),{...e,ts:Date.now()}]),[]);
 
-  useEffect(()=>{
-    fetch(`${API}/models`).then(r=>r.json()).then(d=>setAllModels(d)).catch(()=>{});
-    fetch(`${API}/config`).then(r=>r.json()).then(d=>{
-      if(d.active_provider)setProvider(d.active_provider);
-      if(d.active_model)setModel(d.active_model);
-      setConfigLoaded(true);
-    }).catch(()=>{});
+  const applyWorkspace=useCallback((d)=>{
+    if(!d)return;
+    setGoal(d.goal||"");
+    setTasks(d.tasks||[]);setProgress(d.progress||"0/0");
+    setLog((d.events||[]).map(e=>({...e,kind:e.kind||"info",text:e.text||e.kind})));
+    setIsRunning(!!d.is_running);setControlOwner(d.control_owner||"agent");
+    setUrl(d.url||"");setTitle(d.title||"");
+    const meta=d.session?.metadata||{};
+    setCurrentTaskDescription(meta.current_task_description||"");
+    setCurrentTaskEnvironment(meta.current_task_environment||"");
+    setStep(meta.step||0);
+    if(meta.provider)setActiveProvider(meta.provider);
+    if(meta.model)setActiveModel(meta.model);
+    setStatus(d.is_running?"thinking":d.session?.status==="completed"?"done":"idle");
   },[]);
+
+  const loadBotWorkspace=useCallback(async(id,changeSelection=true)=>{
+    if(changeSelection){setSelectedBotId(id);selectedBotRef.current=id;}
+    try{
+      const [workspace,snapshot]=await Promise.all([
+        fetch(`${API}/workspace/state?bot_id=${encodeURIComponent(id)}`).then(r=>r.json()),
+        fetch(`${API}/bots/${encodeURIComponent(id)}/snapshot`).then(r=>r.ok?r.json():{}),
+      ]);
+      applyWorkspace(workspace);
+      if(snapshot.screenshot)setScreenshot(snapshot.screenshot); else setScreenshot("");
+      if(snapshot.url!==undefined)setUrl(snapshot.url||"");
+      if(snapshot.title!==undefined)setTitle(snapshot.title||"");
+    }catch(e){setStartError(e.message||"Could not load this bot workspace.");}
+  },[applyWorkspace]);
+
+  const refreshBots=useCallback(()=>fetch(`${API}/bots`).then(r=>r.json()).then(d=>setBots(d.bots||[])).catch(()=>{}),[]);
+
+  useEffect(()=>{
+    Promise.all([
+      fetch(`${API}/models`).then(r=>r.json()),
+      fetch(`${API}/config`).then(r=>r.json()),
+      fetch(`${API}/workspace/state?bot_id=primary`).then(r=>r.json()),
+      fetch(`${API}/bots`).then(r=>r.json()),
+    ]).then(([models,cfg,workspace,botData])=>{
+      const providerId=cfg.active_provider||"ollama_local";
+      const modelId=cfg.active_model||"qwen3:4b";
+      const hydrated={...models};
+      if(!hydrated[providerId]?.includes(modelId))hydrated[providerId]=[modelId,...(hydrated[providerId]||[])];
+      setAllModels(hydrated);setProvider(providerId);setModel(modelId);
+      setBots(botData.bots||[]);applyWorkspace(workspace);setConfigLoaded(true);
+    }).catch(()=>setConfigLoaded(true));
+  },[applyWorkspace]);
 
   const refreshAttachments=useCallback(()=>{
     fetch(`${API}/attachments`).then(r=>r.json()).then(d=>setAttachments(d.attachments||[])).catch(()=>{});
   },[]);
 
   useEffect(()=>{refreshAttachments();},[refreshAttachments]);
+
+  useEffect(()=>{
+    fetch(`${API}/computer/state`).then(r=>r.json()).then(d=>{
+      if(d.control_owner)setControlOwner(d.control_owner);
+      if(d.url)setUrl(d.url);
+      if(d.title)setTitle(d.title);
+    }).catch(()=>{});
+  },[]);
+
+  useEffect(()=>{
+    if(pageView!=="computer"||controlOwner!=="human")return;
+    const refresh=()=>fetch(`${API}/screenshot`).then(r=>r.json()).then(d=>{
+      if(d.screenshot)setScreenshot(d.screenshot);
+      if(d.url!==undefined)setUrl(d.url||"");
+      if(d.title!==undefined)setTitle(d.title||"");
+    }).catch(()=>{});
+    const id=setInterval(refresh,900);
+    return()=>clearInterval(id);
+  },[pageView,controlOwner]);
 
   useEffect(()=>{
     const list=allModels[provider];
@@ -832,6 +1057,7 @@ export default function App(){
       ws.onerror=()=>setConnected(false);
       ws.onmessage=e=>{
         const msg=JSON.parse(e.data);
+        if(msg.bot_id&&msg.bot_id!==selectedBotRef.current){refreshBots();return;}
         if(msg.type==="screenshot"){
           if(msg.data)setScreenshot(msg.data);
           if(msg.url)setUrl(msg.url); if(msg.title)setTitle(msg.title);
@@ -884,9 +1110,31 @@ export default function App(){
           setTimeout(()=>setReplanMsg(""),8000);
         }
         else if(msg.type==="candidates"){setCandidates(msg.candidates||[]);setCandidateTask(msg.task||"");}
+        else if(msg.type==="control_state"){
+          setControlOwner(msg.owner||"agent");
+          if(msg.message){setComputerMessage(msg.message);setTimeout(()=>setComputerMessage(""),3500);}
+        }
+        else if(msg.type==="command_start"){
+          setCommandEvents(prev=>[...prev.slice(-500),{kind:"meta",text:`$ ${msg.command}  (cwd: ${msg.cwd})`}]);
+          addLog({kind:"command",text:`Command started: ${msg.command}`});
+          setRightTab("log");
+        }
+        else if(msg.type==="command_output"){
+          const kind=msg.stream==="stderr"?"stderr":"stdout";
+          const prefix=kind==="stderr"?"ERR":"OUT";
+          setCommandEvents(prev=>[...prev.slice(-500),{kind,text:`${prefix}> ${msg.line||""}`}]);
+        }
+        else if(msg.type==="command_done"){
+          const text=`Command finished: exit ${msg.exit_code}${msg.timed_out?" (timeout)":""} in ${msg.elapsed}s`;
+          setCommandEvents(prev=>[...prev.slice(-500),{kind:"meta",text}]);
+          addLog({kind:"command",text});
+        }
         else if(msg.type==="agent_start"){
           setIsRunning(true);setStatus("thinking");setStep(0);setElapsed("");
+          setControlOwner("agent");
+          setStartError("");
           setLog([]);setThought("");setSummary("");setDoneResult(null);
+          setCommandEvents([]);
           setTasks([]);setProgress("");setIsPlanning(false);setIsReplanning(false);
           setCurrentTaskEnvironment("");setCurrentTaskDescription("");
           setReplanMsg("");setCandidates([]);setCandidateTask("");
@@ -908,6 +1156,7 @@ export default function App(){
                 body:JSON.stringify({
                   goal:ng,provider:provRef.current,model:modRef.current,auto_restart:true,
                   attachments: attachmentsRef.current.map(a=>a.id),
+                  bot_id:selectedBotRef.current,
                 })});
             },3000);
             addLog({kind:"info",text:"🔄 Auto-restarting in 3s…"});
@@ -918,29 +1167,80 @@ export default function App(){
           setCurrentTaskEnvironment("");setCurrentTaskDescription("");
           addLog({kind:"info",text:"⏹ Stopped"});
         }
-        else if(msg.type==="error"){setStatus("error");addLog({kind:"error",text:`❌ ${msg.message}`});}
+        else if(msg.type==="error"){
+          setStatus("error");setStartError(msg.message||"The agent stopped unexpectedly.");
+          addLog({kind:"error",text:`❌ ${msg.message}`});
+        }
         else if(msg.type==="warning"){addLog({kind:"warning",text:`⚠ ${msg.message}`});}
+        else if(msg.type==="model_queue"){addLog({kind:"info",text:`Queued: ${msg.message}`});}
       };
     }
     connect(); return()=>wsRef.current?.close();
-  },[addLog]);
+  },[addLog,refreshBots]);
 
   useEffect(()=>{logRef.current?.scrollTo({top:logRef.current.scrollHeight,behavior:"smooth"});},[log]);
 
   const startAgent=async()=>{
-    if(!connected)return;
-    await fetch(`${API}/start`,{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        goal,provider,model,auto_restart:autoRestart,restart_goal:"",
-        attachments: attachments.map(a=>a.id),
-      })});
+    if(!connected){setStartError("Backend is offline. Start it and try again.");return;}
+    if(!goal.trim()){setStartError("Describe a task before starting the agent.");return;}
+    setStartError("");
+    try{
+      const r=await fetch(`${API}/start`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          goal,provider,model,auto_restart:autoRestart,restart_goal:"",
+          attachments: attachments.map(a=>a.id),
+          bot_id:selectedBotId,
+        })});
+      const d=await r.json();
+      if(!r.ok)throw new Error(d.detail||d.error||"The agent could not be started.");
+    }catch(e){setStartError(e.message||"The agent could not be started.");}
   };
   const stopAgent=async()=>{await fetch(`${API}/stop`,{method:"POST"});};
+
+  const updateComputerFromResponse=(d)=>{
+    if(d?.screenshot)setScreenshot(d.screenshot);
+    if(d?.url!==undefined)setUrl(d.url||"");
+    if(d?.title!==undefined)setTitle(d.title||"");
+    if(d?.control_owner)setControlOwner(d.control_owner);
+  };
+
+  const manualAction=async(action)=>{
+    if(computerBusy)return null;
+    setComputerBusy(true);
+    try{
+      const r=await fetch(`${API}/manual`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(action)});
+      const d=await r.json();
+      if(!r.ok)throw new Error(d.detail||d.error||"Browser interaction failed");
+      updateComputerFromResponse(d);
+      return d;
+    }catch(e){
+      setComputerMessage(e.message||"Browser interaction failed");
+      setTimeout(()=>setComputerMessage(""),3500);
+      return null;
+    }finally{setComputerBusy(false);}
+  };
+
+  const takeControl=async()=>{
+    const r=await fetch(`${API}/computer/take-control`,{method:"POST"});
+    const d=await r.json();
+    setControlOwner(d.control_owner||"human");
+    setComputerMessage("You are now driving this browser.");
+    setTimeout(()=>setComputerMessage(""),3500);
+  };
+
+  const resumeAgent=async()=>{
+    const r=await fetch(`${API}/computer/resume-agent`,{method:"POST"});
+    const d=await r.json();
+    setControlOwner(d.control_owner||"agent");
+    setComputerMessage(isRunning?"Agent resumed from the current page.":"Browser returned to agent mode.");
+    setTimeout(()=>setComputerMessage(""),3500);
+  };
+
   const manualNavigate=async()=>{
     if(!manualUrl)return;
     let u=manualUrl; if(!u.startsWith("http"))u="https://"+u;
-    await fetch(`${API}/manual`,{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({action:"navigate",url:u})});
+    await manualAction({action:"navigate",url:u});
     setManualUrl("");
   };
   const uploadAttachments=async(files)=>{
@@ -959,9 +1259,64 @@ export default function App(){
       body:JSON.stringify({description,priority})});
   };
 
+  const clickComputer=async(e)=>{
+    if(isRunning&&controlOwner!=="human")return;
+    const img=e.currentTarget;
+    const rect=img.getBoundingClientRect();
+    const x=Math.round((e.clientX-rect.left)*(img.naturalWidth/rect.width));
+    const y=Math.round((e.clientY-rect.top)*(img.naturalHeight/rect.height));
+    await manualAction({action:"click",x,y});
+  };
+
+  const scrollComputer=async(direction)=>{
+    if(isRunning&&controlOwner!=="human")return;
+    await manualAction({action:"scroll",direction,amount:520});
+  };
+
+  const wheelComputer=(deltaY)=>{
+    if((isRunning&&controlOwner!=="human")||!deltaY)return;
+    wheelDeltaRef.current+=deltaY;
+    clearTimeout(wheelTimerRef.current);
+    wheelTimerRef.current=setTimeout(()=>{
+      const delta=wheelDeltaRef.current;wheelDeltaRef.current=0;
+      manualAction({action:"scroll",direction:delta<0?"up":"down",amount:Math.max(160,Math.min(900,Math.abs(Math.round(delta*2))))});
+    },70);
+  };
+
+  const selectBot=async(id,page="computer")=>{
+    await loadBotWorkspace(id,true);setPageView(page);refreshBots();
+  };
+
+  const createBot=async(name,role)=>{
+    const r=await fetch(`${API}/bots`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,role})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.detail||"Could not create bot");
+    await refreshBots();await selectBot(d.bot.id,"bots");
+  };
+
+  const sendOperatorText=async(submit=false)=>{
+    if(!operatorText)return;
+    await manualAction({action:submit?"type_and_submit":"type",text:operatorText});
+    setOperatorText("");
+  };
+
   const sColor={idle:"#6b7280",thinking:"#f59e0b",acting:"#3b82f6",done:"#22c55e",error:"#ef4444"}[status];
   const sLabel={idle:"Idle",thinking:"Thinking…",acting:"Executing",done:"Done",error:"Error"}[status];
   const pColor=PROVIDER_COLORS[activeProvider]||"#6366f1";
+
+  return <NexusShell {...{
+    pageView,setPageView,mobileNav,setMobileNav,connected,isRunning,status,sLabel,sColor,
+    goal,setGoal,startAgent,stopAgent,provider,setProvider,model,setModel,allModels,autoRestart,setAutoRestart,
+    screenshot,url,title,controlOwner,computerBusy,manualUrl,setManualUrl,manualNavigate,manualAction,
+    clickComputer,scrollComputer,wheelComputer,operatorText,setOperatorText,sendOperatorText,takeControl,resumeAgent,computerMessage,
+    tasks,progress,currentTaskEnvironment,currentTaskDescription,isPlanning,isReplanning,replanMsg,candidates,candidateTask,
+    log,thought,summary,step,elapsed,activeProvider,activeModel,pColor,attachments,uploadAttachments,removeAttachment,
+    refreshAttachments,fileInputRef,injectTask,activityFilter,setActivityFilter,commandEvents,
+    showSettings,setShowSettings,showProfiles,setShowProfiles,showResults,setShowResults,showLogs,setShowLogs,
+    doneResult,setDoneResult,startError,SettingsPanel,ProfilesPanel,FileBrowser,ResultsModal,InjectPanel,
+    bots,selectedBotId,selectBot,createBot,
+    api:API,startAgain:()=>{setDoneResult(null);setTimeout(startAgent,300)}
+  }}/>;
 
   return(
     <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#0a0c12",
@@ -1249,7 +1604,7 @@ export default function App(){
               )}
             </div>
           ):(
-            <div style={{flex:1,overflow:"hidden"}}><LiveLog isRunning={isRunning}/></div>
+            <div style={{flex:1,overflow:"hidden"}}><LiveLog isRunning={isRunning} commandEvents={commandEvents}/></div>
           )}
         </div>
       </div>

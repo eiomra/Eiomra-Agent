@@ -3,13 +3,13 @@ AI Browser Agent — agent.py
 Multi-provider AI + structured task planning + rich page extraction
 """
 
-import asyncio, base64, json, os, re, sys, time, traceback
-from contextlib import asynccontextmanager
+import asyncio, base64, hashlib, json, os, re, shutil, sys, time, traceback
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Any
 
 import httpx, uvicorn
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 
@@ -39,6 +39,7 @@ from desktop_automation_portable import (
 from page_reader  import extract_page_content, get_capabilities, rank_candidates, format_candidates
 from action_protocol import action_to_history_entry, normalize_action_payload
 from agent_sessions import AgentOrchestrator, AgentSessionStore
+from bot_registry import BotRegistry
 from git_context import GitContextProvider
 from method_memory import MethodMemoryStore
 from repo_retrieval import RepoRetrievalIndex
@@ -92,11 +93,14 @@ LOGS_DIR    = os.path.join(BASE_DIR, "logs")
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 MEMORY_DIR = os.path.join(BASE_DIR, "memory")
+BOT_SNAPSHOTS_DIR = os.path.join(BASE_DIR, "bot_snapshots")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-for d in (RESULTS_DIR, LOGS_DIR, SESSIONS_DIR, UPLOADS_DIR, MEMORY_DIR): os.makedirs(d, exist_ok=True)
+BOT_REGISTRY_FILE = os.path.join(BASE_DIR, "bots.json")
+for d in (RESULTS_DIR, LOGS_DIR, SESSIONS_DIR, UPLOADS_DIR, MEMORY_DIR, BOT_SNAPSHOTS_DIR): os.makedirs(d, exist_ok=True)
 
 session_store = AgentSessionStore(SESSIONS_DIR)
 orchestrator = AgentOrchestrator(session_store)
+bot_registry = BotRegistry(BOT_REGISTRY_FILE)
 repo_index = RepoRetrievalIndex(WORKSPACE_ROOT)
 git_context_provider = GitContextProvider(WORKSPACE_ROOT)
 attachment_reader = AttachmentReader()
@@ -142,6 +146,12 @@ DEFAULT_CONFIG = {
     "desktop_autonomy_scope": "browser_only",  # browser_only | browser_and_desktop
     "command_execution_mode": "manual",  # disabled | manual | auto
     "command_timeout_seconds": 120,
+    "model_request_timeout_seconds": 600,
+    "ollama_queue_enabled": True,
+    "ollama_queue_min_interval_seconds": 6,
+    "ollama_queue_max_retries": 3,
+    "ollama_queue_backoff_seconds": 10,
+    "resume_incomplete_on_startup": True,
     "multi_agent_enabled": True,
     "multi_agent_mode": "auto",  # off | auto
     "max_parallel_agents": 4,
@@ -232,7 +242,15 @@ class SessionLogger:
     def _write(self, line):
         try: self._f.write(line+"\n"); self._f.flush(); os.fsync(self._f.fileno())
         except Exception: pass
-        print(line, flush=True)
+        # Windows services and redirected terminals often default to cp1252.
+        # Keep the UTF-8 file intact, but replace unsupported console glyphs
+        # instead of crashing the entire agent run while logging a divider.
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe_line = str(line).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            print(safe_line, flush=True)
     def _divider(self, c="─", w=72): self._write(c*w)
     def _section(self, t):
         self._write(""); self._divider("═")
@@ -388,6 +406,57 @@ async def call_provider(provider, model, system_prompt, user_prompt, cfg,
         raise ValueError(f"Unknown provider: {provider}")
 
 
+_provider_request_locks: dict[str, asyncio.Lock] = {}
+_provider_last_request_at: dict[str, float] = {}
+
+
+def _is_retryable_model_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        body = (exc.response.text or "").lower()
+        return status in (408, 429, 500, 502, 503, 504) or (
+            status == 403 and any(word in body for word in ("rate", "limit", "quota", "too many"))
+        )
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+
+
+async def call_provider_queued(provider, model, system_prompt, user_prompt, cfg,
+                               image_b64: str | None = None) -> str:
+    """Serialize Ollama requests and retry rate limits with visible backoff."""
+    if not provider.startswith("ollama_") or not cfg.get("ollama_queue_enabled", True):
+        return await call_provider(provider, model, system_prompt, user_prompt, cfg, image_b64=image_b64)
+
+    lock = _provider_request_locks.setdefault(provider, asyncio.Lock())
+    async with lock:
+        interval = max(0.0, float(cfg.get("ollama_queue_min_interval_seconds", 6)))
+        wait_for = interval - (time.monotonic() - _provider_last_request_at.get(provider, 0.0))
+        if wait_for > 0:
+            await broadcast({"type": "model_queue", "provider": provider,
+                             "message": f"Ollama request queued for {wait_for:.1f}s to respect the rate limit."})
+            await asyncio.sleep(wait_for)
+
+        retries = max(0, int(cfg.get("ollama_queue_max_retries", 3)))
+        base_backoff = max(1.0, float(cfg.get("ollama_queue_backoff_seconds", 10)))
+        for attempt in range(retries + 1):
+            try:
+                _provider_last_request_at[provider] = time.monotonic()
+                return await call_provider(provider, model, system_prompt, user_prompt, cfg,
+                                           image_b64=image_b64)
+            except Exception as exc:
+                if attempt >= retries or not _is_retryable_model_error(exc):
+                    raise
+                retry_after = None
+                if isinstance(exc, httpx.HTTPStatusError):
+                    retry_after = exc.response.headers.get("retry-after")
+                try:
+                    delay = max(base_backoff * (2 ** attempt), float(retry_after)) if retry_after else base_backoff * (2 ** attempt)
+                except (TypeError, ValueError):
+                    delay = base_backoff * (2 ** attempt)
+                await broadcast({"type": "model_queue", "provider": provider,
+                                 "message": f"Ollama rate limit reached. Retrying in {delay:.0f}s ({attempt + 1}/{retries})."})
+                await asyncio.sleep(delay)
+
+
 async def call_with_fallback(system_prompt, user_prompt,
                               preferred_provider, preferred_model,
                               cfg, log_query=True,
@@ -399,22 +468,40 @@ async def call_with_fallback(system_prompt, user_prompt,
                 providers.append((p, cfg["fallback_models"][p]))
 
     last_error = None
-    for provider, model in providers:
+    for attempt_index, (provider, model) in enumerate(providers):
+        has_next_provider = attempt_index < len(providers) - 1
         try:
             if log_query and session_log:
                 session_log.query(provider, model, system_prompt, user_prompt)
-            raw = await call_provider(provider, model, system_prompt, user_prompt, cfg,
-                                      image_b64=image_b64)
+            timeout_seconds = max(30, int(cfg.get("model_request_timeout_seconds", 600)))
+            await broadcast({
+                "type": "info",
+                "message": f"Waiting for {PROVIDER_LABELS.get(provider, provider)} model response...",
+            })
+            raw = await asyncio.wait_for(
+                call_provider_queued(provider, model, system_prompt, user_prompt, cfg,
+                                     image_b64=image_b64),
+                timeout=timeout_seconds,
+            )
             if log_query and session_log:
                 session_log.raw_reply(raw)
             return raw, provider, model
+        except asyncio.TimeoutError as e:
+            last_error = e
+            msg = f"Timed out after {timeout_seconds}s waiting for model response"
+            if session_log: session_log.error(f"{provider} timeout", msg)
+            await broadcast({"type":"warning" if has_next_provider else "error",
+                             "message":f"[{PROVIDER_LABELS.get(provider,provider)}] {msg}"
+                             + (" - trying fallback..." if has_next_provider else "")})
+            if not has_next_provider: break
+            await asyncio.sleep(1)
         except Exception as e:
             last_error = e
             if session_log: session_log.error(f"{provider} failed", str(e))
-            await broadcast({"type":"error",
+            await broadcast({"type":"warning" if has_next_provider else "error",
                              "message":f"[{PROVIDER_LABELS.get(provider,provider)}] {e}"
-                             + (" — trying fallback..." if cfg.get("fallback_enabled") else "")})
-            if not cfg.get("fallback_enabled"): break
+                             + (" — trying fallback..." if has_next_provider else "")})
+            if not has_next_provider: break
             await asyncio.sleep(1)
 
     raise RuntimeError(f"All providers failed. Last error: {last_error}")
@@ -430,6 +517,16 @@ agent_task      = None
 inject_queue: list = []   # user-injected tasks waiting to be added
 current_tracker = None    # exposed for /inject endpoint
 current_session_task_id = None
+current_bot_id = "primary"
+
+# The agent and a person may observe the same persistent Chromium page, but only
+# one may drive it at a time. The generation counter lets the agent discard a
+# model decision if a human changed the page while that decision was in flight.
+control_owner = "agent"  # agent | human
+control_generation = 0
+agent_control_event = asyncio.Event()
+agent_control_event.set()
+browser_input_lock = asyncio.Lock()
 
 # Last desktop screenshot captured during this step, as base64 JPEG.
 # Passed to the next model call so the model sees the actual screen.
@@ -506,6 +603,7 @@ def build_attachment_context(attachment_ids: list[str] | None) -> tuple[str, lis
 
 
 async def broadcast(msg: dict):
+    msg = {"bot_id": current_bot_id, **msg}
     dead = []
     seen = set()
     for ws in active_ws:
@@ -526,6 +624,110 @@ async def broadcast_session_state(task_id: str | None):
     session = orchestrator.resume_session(task_id)
     if session:
         await broadcast({"type": "session_state", "session": session.to_dict()})
+
+
+async def wait_for_agent_control() -> bool:
+    """Wait until automation owns the shared browser again."""
+    while agent_running and control_owner == "human":
+        await agent_control_event.wait()
+    return agent_running
+
+
+async def run_command_streaming_action(request, timeout: int = 120) -> str:
+    command_id = f"cmd-{int(time.time() * 1000)}"
+    timeout = max(1, int(timeout or 120))
+    started = time.time()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    if session_log:
+        session_log._heading("COMMAND START")
+        session_log._raw(f"Command: {request.command}")
+        session_log._raw(f"CWD: {request.resolved_cwd}")
+
+    await broadcast({
+        "type": "command_start",
+        "id": command_id,
+        "command": request.command,
+        "cwd": request.resolved_cwd,
+        "timeout": timeout,
+    })
+
+    process = await asyncio.create_subprocess_shell(
+        request.command,
+        cwd=request.resolved_cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def pump(stream, stream_name: str, sink: list[str]):
+        if stream is None:
+            return
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").rstrip("\r\n")
+            sink.append(text)
+            if session_log:
+                session_log._write(f"    [{stream_name}] {text}")
+            await broadcast({
+                "type": "command_output",
+                "id": command_id,
+                "stream": stream_name.lower(),
+                "line": text[:2000],
+            })
+
+    stdout_task = asyncio.create_task(pump(process.stdout, "STDOUT", stdout_lines))
+    stderr_task = asyncio.create_task(pump(process.stderr, "STDERR", stderr_lines))
+    timed_out = False
+
+    try:
+        returncode = await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+        process.kill()
+        with suppress(Exception):
+            returncode = await process.wait()
+        timeout_line = f"Command timed out after {timeout}s"
+        stderr_lines.append(timeout_line)
+        if session_log:
+            session_log._write(f"    [TIMEOUT] {timeout_line}")
+        await broadcast({
+            "type": "command_output",
+            "id": command_id,
+            "stream": "stderr",
+            "line": timeout_line,
+        })
+    finally:
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.gather(stdout_task, stderr_task), timeout=2)
+
+    elapsed = round(time.time() - started, 2)
+    returncode = process.returncode if process.returncode is not None else -1
+    await broadcast({
+        "type": "command_done",
+        "id": command_id,
+        "exit_code": returncode,
+        "timed_out": timed_out,
+        "elapsed": elapsed,
+    })
+
+    stdout = "\n".join(stdout_lines).strip()
+    stderr = "\n".join(stderr_lines).strip()
+    pieces = [
+        f"Command: {request.command}",
+        f"CWD: {request.resolved_cwd}",
+        f"Exit code: {returncode}",
+        f"Elapsed: {elapsed}s",
+    ]
+    if timed_out:
+        pieces.append(f"Timed out after {timeout}s")
+    if stdout:
+        pieces.append("STDOUT:\n" + stdout[:6000])
+    if stderr:
+        pieces.append("STDERR:\n" + stderr[:4000])
+    return "\n\n".join(pieces)
 
 
 def build_repo_and_git_context(query: str, repo_limit: int = 3) -> tuple[str, str, list[str]]:
@@ -1048,6 +1250,10 @@ async def screenshot_b64() -> str:
     if not page: return ""
     try:
         buf = await page.screenshot(type="jpeg", quality=60, full_page=False)
+        bot = bot_registry.get(current_bot_id)
+        if bot:
+            with open(os.path.join(BOT_SNAPSHOTS_DIR, f"{current_bot_id}.jpg"), "wb") as handle:
+                handle.write(buf)
         return base64.b64encode(buf).decode()
     except Exception: return ""
 
@@ -1621,6 +1827,13 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
         elif act == "back":
             await page.go_back(); await asyncio.sleep(1); result = "Navigated back"
 
+        elif act == "forward":
+            await page.go_forward(); await asyncio.sleep(1); result = "Navigated forward"
+
+        elif act == "reload":
+            await page.reload(wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(0.5); result = "Reloaded page"
+
         elif act == "focus_field":
             # Find ANY input/textarea by id, name, placeholder, or label text,
             # scroll it into view, and focus it — even if it's hidden in a tab/panel
@@ -1981,7 +2194,7 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
                 result = (f"Command not auto-run because command_execution_mode=manual. "
                           f"Review and run manually if desired: {request.command} (cwd={request.resolved_cwd})")
             else:
-                result = run_command_action(
+                result = await run_command_streaming_action(
                     request,
                     timeout=int(cfg.get("command_timeout_seconds", 120)),
                 )
@@ -2080,6 +2293,45 @@ def _collect_artifact_context(executed_actions: list[dict[str, Any]]) -> str:
             f"Content:\n{content[:2000]}"
         )
     return "\n\n".join(snippets[:3])
+
+
+def _sync_final_report_artifacts(goal: str, report: str,
+                                 executed_actions: list[dict[str, Any]],
+                                 cfg: dict) -> list[str]:
+    """Replace intermediate summary artifacts with the completed final report."""
+    if not report.strip() or not cfg.get("local_file_write_enabled", True):
+        return []
+    report_terms = ("summary", "report", "finding", "findings", "research", "notes", "details", "detailing")
+    write_terms = ("write", "create", "save", "document", "record")
+    synced: list[str] = []
+    seen: set[str] = set()
+    text_artifacts = []
+    for item in executed_actions:
+        decision = item.get("decision") or {}
+        if decision.get("action") not in {"write_file", "create_file", "create_markdown_report"}:
+            continue
+        raw_path = str(decision.get("path") or "").strip()
+        if os.path.splitext(raw_path)[1].lower() not in {".txt", ".md", ".markdown"}:
+            continue
+        text_artifacts.append((item, decision, raw_path))
+    goal_intent = goal.lower()
+    goal_requests_report = (any(term in goal_intent for term in report_terms)
+                            and any(term in goal_intent for term in write_terms))
+    for item, decision, raw_path in text_artifacts:
+        task_description = str(item.get("task_description") or "")
+        artifact_intent = f"{task_description}\n{os.path.basename(raw_path)}".lower()
+        explicitly_a_report = (any(term in artifact_intent for term in report_terms)
+                               and any(term in artifact_intent for term in write_terms))
+        if not explicitly_a_report and not (goal_requests_report and len(text_artifacts) == 1):
+            continue
+        resolved = resolve_allowed_path(raw_path, cfg, WORKSPACE_ROOT)
+        key = os.path.normcase(resolved)
+        if key in seen:
+            continue
+        write_file_action(resolved, report.rstrip() + "\n", False, cfg, WORKSPACE_ROOT)
+        seen.add(key)
+        synced.append(resolved)
+    return synced
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2236,12 +2488,23 @@ async def plan_tasks(goal: str, provider: str, model: str, cfg: dict,
 # MAIN AGENT LOOP
 # ══════════════════════════════════════════════════════════════════════════
 async def run_agent(goal: str, provider: str, model: str, cfg: dict,
-                    auto_restart=False, restart_goal="", attachment_ids: list[str] | None = None):
+                    auto_restart=False, restart_goal="", attachment_ids: list[str] | None = None,
+                    resume_task_id: str | None = None, bot_id: str = "primary"):
     global agent_running, session_log, current_session_task_id, _last_screenshot_b64
+    global control_owner, control_generation, current_bot_id
 
     global current_tracker
     agent_running = True
-    history: list       = []
+    current_bot_id = bot_id if bot_registry.get(bot_id) else "primary"
+    control_owner = "agent"
+    control_generation += 1
+    agent_control_event.set()
+    resume_record = orchestrator.resume_session(resume_task_id) if resume_task_id else None
+    if resume_record:
+        goal = resume_record.request
+        provider = str(resume_record.metadata.get("provider") or provider)
+        model = str(resume_record.metadata.get("model") or model)
+    history: list = list(resume_record.metadata.get("runtime_history", [])) if resume_record else []
     executed_actions: list[dict[str, Any]] = []
     failed_attempts: list = []
     task_error_counts: dict[str, int] = {}
@@ -2275,7 +2538,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
     current_model    = model
     _last_screenshot_b64 = None
     stop_reason      = None
-    task_id          = make_task_id(goal)
+    task_id          = resume_record.task_id if resume_record else make_task_id(goal)
     current_session_task_id = task_id
     attachment_context, resolved_attachments = build_attachment_context(attachment_ids)
 
@@ -2309,30 +2572,51 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
         task_error_counts[cur_task.id] = 0
         return True
 
-    initial_lanes, initial_agent_plan = build_agent_lane_plan(goal, cfg, [])
-    orchestrator.create_session(task_id, goal, {
-        "provider": provider,
-        "model": model,
-        "auto_restart": auto_restart,
-        "restart_goal": restart_goal,
-        "attachments": resolved_attachments,
-        "lanes": initial_lanes,
-        "multi_agent_plan": initial_agent_plan,
-    })
+    if resume_record:
+        stored_tasks = resume_record.metadata.get("planned_tasks") or resume_record.metadata.get("final_tasks") or []
+        if not stored_tasks:
+            raise RuntimeError("The interrupted session has no saved task plan to resume.")
+        tracker = TaskTracker(goal, stored_tasks)
+        current_tracker = tracker
+        orchestrator.update_phase(task_id, "inspect", status="running")
+        orchestrator.append_event(task_id, "session_resumed", {"bot_id": current_bot_id})
+    else:
+        initial_lanes, initial_agent_plan = build_agent_lane_plan(goal, cfg, [])
+        orchestrator.create_session(task_id, goal, {
+            "provider": provider,
+            "model": model,
+            "bot_id": current_bot_id,
+            "resume_on_restart": True,
+            "auto_restart": auto_restart,
+            "restart_goal": restart_goal,
+            "attachments": resolved_attachments,
+            "lanes": initial_lanes,
+            "multi_agent_plan": initial_agent_plan,
+        })
     orchestrator.update_lane(task_id, "explorer", status="running", current_step="planning tasks")
     orchestrator.update_lane(task_id, "implementation", status="idle", current_step="waiting for plan")
     orchestrator.update_lane(task_id, "review", status="idle", current_step="waiting for plan")
 
-    await broadcast({"type":"agent_start","goal":goal,"provider":provider,"model":model})
+    bot_registry.update(current_bot_id, status="running", current_task_id=task_id, current_goal=goal)
+    await broadcast({"type":"agent_start","goal":goal,"provider":provider,"model":model,
+                     "bot_id": current_bot_id, "resumed": bool(resume_record)})
     await broadcast_session_state(task_id)
 
     # ── Phase 1: Plan ────────────────────────────────────────────────────
-    tracker = await plan_tasks(
-        goal, provider, model, cfg,
-        task_id=task_id,
-        attachment_context=attachment_context,
-    )
-    current_tracker = tracker
+    if not resume_record:
+        tracker = await plan_tasks(
+            goal, provider, model, cfg,
+            task_id=task_id,
+            attachment_context=attachment_context,
+        )
+        current_tracker = tracker
+    else:
+        await broadcast({"type": "plan_ready", "tasks": tracker.to_dict()["tasks"],
+                         "progress": f"{tracker.completed_count}/{tracker.total_count}", "resumed": True})
+        stored_url = str(resume_record.metadata.get("current_url") or "")
+        if stored_url.startswith(("http://", "https://")) and page.url != stored_url:
+            with suppress(Exception):
+                await page.goto(stored_url, wait_until="domcontentloaded", timeout=30000)
     orchestrator.update_phase(task_id, "inspect")
     orchestrator.update_lane(task_id, "explorer", status="running", current_step="reading page context")
     await broadcast_session_state(task_id)
@@ -2349,6 +2633,10 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             if session_log: session_log._heading("STOPPED BY USER")
             await broadcast({"type":"agent_stopped","message":"Stopped by user"})
             break
+
+        # A person can pause the loop and operate the exact same Chromium page.
+        if not await wait_for_agent_control():
+            continue
 
         elapsed = time.time() - start_time
         if max_time_on and elapsed >= max_time_secs:
@@ -2423,7 +2711,15 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             current_task_environment=_choose_task_environment(goal, cur_task.description if cur_task else ""),
             progress=progress,
             repo_paths=repo_paths,
+            provider=current_provider,
+            model=current_model,
+            bot_id=current_bot_id,
+            planned_tasks=tracker.to_dict()["tasks"],
+            runtime_history=history[-80:],
         )
+        bot_registry.update(current_bot_id, status="running", current_task_id=task_id,
+                            current_goal=goal, last_url=context.get("url", ""),
+                            last_title=context.get("title", ""))
         orchestrator.append_event(task_id, "step_started", {
             "step": step,
             "url": context.get("url", ""),
@@ -2576,6 +2872,11 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             })
 
         # ── Query model ──────────────────────────────────────────────────
+        # Do not ask for a new action while a person is changing the page.
+        if not await wait_for_agent_control():
+            continue
+        decision_control_generation = control_generation
+
         user_prompt = build_execution_prompt(
             tracker, context, history, stuck_hint, candidates_str,
             repo_context=repo_context, git_context=git_context,
@@ -2660,6 +2961,22 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             "summary":summary,"step":step,"decision":decision,
             "provider":current_provider,"model":current_model,
         })
+
+        # If control changed hands while the model was thinking, its decision is
+        # based on an old page. Wait for the user to finish, then inspect again.
+        if not await wait_for_agent_control():
+            continue
+        if decision_control_generation != control_generation:
+            history.append({
+                "action": "human_takeover",
+                "result": "The user interacted with the shared browser; page state must be inspected again.",
+            })
+            orchestrator.append_event(task_id, "human_takeover_completed", {"step": step})
+            await broadcast({
+                "type": "thinking",
+                "message": "Human control returned. Re-reading the browser before the next action...",
+            })
+            continue
 
         task_environment = _choose_task_environment(goal, cur_task.description if cur_task else "")
         external_browser_launch_task = bool(
@@ -2871,6 +3188,8 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 if ok: session_log.task_completed(completed_task_id, finding)
                 else:  session_log.error("complete_task", msg)
             history.append({"action":f"complete_task: {completed_task_id}","result":msg})
+            orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
+                                      runtime_history=history[-80:])
             orchestrator.append_event(task_id, "task_completed", {
                 "task_id": completed_task_id,
                 "finding": finding,
@@ -2903,6 +3222,8 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 if ok: session_log.task_skipped(skipped_task_id, reason)
                 else:  session_log.error("skip_task", msg)
             history.append({"action":f"skip_task: {skipped_task_id}","result":msg})
+            orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
+                                      runtime_history=history[-80:])
             orchestrator.append_event(task_id, "task_skipped", {
                 "task_id": skipped_task_id,
                 "reason": reason,
@@ -2938,7 +3259,8 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
         url_before = page.url if page else ""
         orchestrator.update_lane(task_id, "implementation", status="running", current_step=f"executing {action}")
         try:
-            result = await execute_action(decision)
+            async with browser_input_lock:
+                result = await execute_action(decision)
         except Exception as e:
             error_message = f"{type(e).__name__}: {e}"
             history.append({"action": f"{action} (error)", "result": error_message})
@@ -2961,6 +3283,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
         executed_actions.append({
             "decision": dict(decision),
             "result": result,
+            "task_description": cur_task.description if cur_task else "",
         })
         if cur_task:
             task_error_counts[cur_task.id] = 0
@@ -3083,6 +3406,20 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
         except Exception as e:
             report = f"Report generation failed: {e}"
 
+        synced_report_artifacts: list[str] = []
+        if not report.startswith("Report generation failed:"):
+            try:
+                synced_report_artifacts = _sync_final_report_artifacts(goal, report, executed_actions, cfg)
+                for artifact_path in synced_report_artifacts:
+                    history.append({"action": "sync_final_report",
+                                    "result": f"Final report written to {artifact_path}"})
+                    await broadcast({"type": "info",
+                                     "message": f"Finalized requested report file: {artifact_path}"})
+            except Exception as exc:
+                orchestrator.append_event(task_id, "report_artifact_sync_failed", {"error": str(exc)})
+                await broadcast({"type": "warning",
+                                 "message": f"Could not finalize requested report file: {exc}"})
+
         filename = ""
         try:
             fp = save_result(tracker, report, history, current_provider, current_model)
@@ -3101,6 +3438,9 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             final_report=report,
             result_filename=filename,
             final_tasks=tracker.to_dict()["tasks"],
+            planned_tasks=tracker.to_dict()["tasks"],
+            runtime_history=history[-80:],
+            synced_report_artifacts=synced_report_artifacts,
         )
         orchestrator.append_event(task_id, "session_completed", {
             "reason": stop_reason,
@@ -3125,9 +3465,12 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             "restart_goal":restart_goal,
         })
         await broadcast_session_state(task_id)
+        bot_registry.update(current_bot_id, status="ready", current_task_id="",
+                            current_goal=goal)
     else:
         elapsed = time.time() - start_time
         orchestrator.set_metadata(task_id, stop_reason="stopped by user", elapsed_seconds=round(elapsed, 2))
+        bot_registry.update(current_bot_id, status="ready", current_task_id="", current_goal=goal)
         if session_log:
             session_log.session_end("stopped by user", step, elapsed)
             session_log = None
@@ -3136,13 +3479,40 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
     current_session_task_id = None
 
 
+async def run_agent_guarded(*args, **kwargs):
+    """Run an agent task without leaving the API in a stale running state."""
+    global agent_running, current_session_task_id, session_log
+    try:
+        await run_agent(*args, **kwargs)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        if session_log:
+            try:
+                session_log.error("fatal", error_message)
+                session_log.close()
+            except Exception:
+                pass
+            session_log = None
+        await broadcast({"type": "error", "message": error_message})
+        await broadcast({"type": "agent_stopped", "message": "Agent stopped after an unexpected error"})
+        if current_session_task_id:
+            orchestrator.append_event(current_session_task_id, "fatal_error", {"error": error_message})
+            orchestrator.set_metadata(current_session_task_id, last_error=error_message)
+        bot_registry.update(current_bot_id, status="interrupted")
+    finally:
+        agent_running = False
+        current_session_task_id = None
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # LIFESPAN (replaces deprecated on_event startup/shutdown)
 # ══════════════════════════════════════════════════════════════════════════
 @asynccontextmanager
 async def lifespan(app):
     # ── STARTUP ──────────────────────────────────────────────────────────
-    global browser, page, playwright_instance
+    global browser, page, playwright_instance, agent_task
     playwright_instance = await async_playwright().start()
 
     # Persistent browser profile — saves cookies/sessions to disk
@@ -3174,6 +3544,29 @@ async def lifespan(app):
     print(f"Browser ready | Profile: {profile_name!r} | "
           f"OCR:{'yes' if caps['ocr'] else 'no'} PDF:{'yes' if caps['pdf'] else 'no'}", flush=True)
     print(f"   Sessions persist in: {profile_dir}", flush=True)
+
+    startup_cfg = load_config()
+    if startup_cfg.get("resume_incomplete_on_startup", True):
+        interrupted = next((session for session in orchestrator.list_sessions()
+                            if session.status == "running"
+                            and session.metadata.get("resume_on_restart") is True
+                            and (session.metadata.get("planned_tasks") or session.metadata.get("final_tasks"))), None)
+        if interrupted:
+            meta = interrupted.metadata
+            attachment_ids = [item.get("id") for item in meta.get("attachments", [])
+                              if isinstance(item, dict) and item.get("id")]
+            agent_task = asyncio.create_task(run_agent_guarded(
+                interrupted.request,
+                str(meta.get("provider") or startup_cfg["active_provider"]),
+                str(meta.get("model") or startup_cfg["active_model"]),
+                startup_cfg,
+                bool(meta.get("auto_restart", False)),
+                str(meta.get("restart_goal") or ""),
+                attachment_ids,
+                resume_task_id=interrupted.task_id,
+                bot_id=str(meta.get("bot_id") or "primary"),
+            ))
+            print(f"Resuming interrupted session: {interrupted.task_id}", flush=True)
 
     yield  # ← server runs here
 
@@ -3207,6 +3600,79 @@ async def current_session():
         return {"session": None}
     session = orchestrator.resume_session(current_session_task_id)
     return {"session": session.to_dict() if session else None}
+
+
+def _latest_session_for_bot(bot_id: str):
+    return next((session for session in orchestrator.list_sessions()
+                 if str(session.metadata.get("bot_id") or "primary") == bot_id), None)
+
+
+def _workspace_payload(bot_id: str) -> dict:
+    bot = bot_registry.get(bot_id) or bot_registry.get("primary")
+    resolved_id = str(bot.get("id") or "primary")
+    session = _latest_session_for_bot(resolved_id)
+    metadata = session.metadata if session else {}
+    tasks = metadata.get("planned_tasks") or metadata.get("final_tasks") or []
+    done = sum(1 for task in tasks if task.get("status") in ("completed", "skipped"))
+    events = []
+    if session:
+        for event in session.events[-100:]:
+            payload = event.payload or {}
+            events.append({"ts": event.at, "kind": event.kind,
+                           "text": payload.get("message") or payload.get("finding") or payload.get("reason") or event.kind,
+                           **payload})
+    return {
+        "bot": bot,
+        "session": session.to_dict() if session else None,
+        "goal": session.request if session else "",
+        "tasks": tasks,
+        "progress": str(metadata.get("progress") or f"{done}/{len(tasks)}"),
+        "events": events,
+        "is_running": bool(agent_running and resolved_id == current_bot_id),
+        "control_owner": control_owner if resolved_id == current_bot_id else "agent",
+        "url": metadata.get("current_url") or bot.get("last_url") or "",
+        "title": metadata.get("current_title") or bot.get("last_title") or "",
+    }
+
+
+@app.get("/bots")
+async def list_bots():
+    items = []
+    for bot in bot_registry.list():
+        workspace = _workspace_payload(str(bot.get("id")))
+        items.append({**bot, "task_count": len(workspace["tasks"]),
+                      "progress": workspace["progress"], "is_running": workspace["is_running"]})
+    return {"bots": items, "active_bot_id": current_bot_id}
+
+
+@app.post("/bots")
+async def create_bot(body: dict):
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A bot name is required.")
+    return {"bot": bot_registry.create(name, str(body.get("role") or ""))}
+
+
+@app.get("/workspace/state")
+async def workspace_state(bot_id: str = "primary"):
+    return _workspace_payload(bot_id)
+
+
+@app.get("/bots/{bot_id}/snapshot")
+async def bot_snapshot(bot_id: str):
+    if not bot_registry.get(bot_id):
+        raise HTTPException(status_code=404, detail="Bot not found")
+    if bot_id == current_bot_id:
+        image = await screenshot_b64()
+    else:
+        path = os.path.join(BOT_SNAPSHOTS_DIR, f"{bot_id}.jpg")
+        image = ""
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                image = base64.b64encode(handle.read()).decode()
+    workspace = _workspace_payload(bot_id)
+    return {"screenshot": image, "url": workspace["url"], "title": workspace["title"],
+            "is_live": bot_id == current_bot_id}
 
 
 @app.get("/repo/index")
@@ -3308,25 +3774,254 @@ async def list_profiles():
     for name in sorted(os.listdir(profiles_dir)):
         path = os.path.join(profiles_dir, name)
         if os.path.isdir(path):
-            # Count cookies as a proxy for "has saved sessions"
-            cookies_file = os.path.join(path, "Default", "Cookies")
-            has_sessions = os.path.exists(cookies_file) and os.path.getsize(cookies_file) > 8192
             profiles.append({
                 "name":         name,
                 "path":         path,
-                "has_sessions": has_sessions,
+                "has_sessions": _profile_has_sessions(path),
                 "active":       name == load_config().get("browser_profile", "default"),
             })
     return {"profiles": profiles}
 
 
+def sanitize_profile_name(name: str, fallback: str = "imported") -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "_", (name or fallback).strip())[:48].strip("_")
+    return clean or fallback
+
+
+def browser_profiles_dir() -> str:
+    path = os.path.join(BASE_DIR, "profiles")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _profile_has_sessions(path: str) -> bool:
+    for rel in ("Default/Cookies", "Default/Network/Cookies", "Cookies", "Network/Cookies"):
+        candidate = os.path.join(path, *rel.split("/"))
+        if os.path.exists(candidate):
+            try:
+                if os.path.getsize(candidate) > 8192:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _source_id(browser: str, kind: str, root: str, profile_path: str) -> str:
+    raw = "|".join([browser, kind, os.path.abspath(root), os.path.abspath(profile_path)])
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _chromium_roots() -> list[tuple[str, str]]:
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA", "")
+    roaming = os.environ.get("APPDATA", "")
+    roots = [
+        ("Chrome", os.path.join(local, "Google", "Chrome", "User Data")),
+        ("Edge", os.path.join(local, "Microsoft", "Edge", "User Data")),
+        ("Brave", os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data")),
+        ("Chromium", os.path.join(local, "Chromium", "User Data")),
+        ("Vivaldi", os.path.join(local, "Vivaldi", "User Data")),
+        ("Opera", os.path.join(roaming, "Opera Software", "Opera Stable")),
+        ("Chrome", os.path.join(home, "Library", "Application Support", "Google", "Chrome")),
+        ("Edge", os.path.join(home, "Library", "Application Support", "Microsoft Edge")),
+        ("Brave", os.path.join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser")),
+        ("Chrome", os.path.join(home, ".config", "google-chrome")),
+        ("Chromium", os.path.join(home, ".config", "chromium")),
+        ("Brave", os.path.join(home, ".config", "BraveSoftware", "Brave-Browser")),
+    ]
+    return [(browser, path) for browser, path in roots if path and os.path.isdir(path)]
+
+
+def _firefox_roots() -> list[tuple[str, str]]:
+    home = os.path.expanduser("~")
+    roaming = os.environ.get("APPDATA", "")
+    roots = [
+        ("Firefox", os.path.join(roaming, "Mozilla", "Firefox", "Profiles")),
+        ("Firefox", os.path.join(home, "Library", "Application Support", "Firefox", "Profiles")),
+        ("Firefox", os.path.join(home, ".mozilla", "firefox")),
+    ]
+    return [(browser, path) for browser, path in roots if path and os.path.isdir(path)]
+
+
+def _safari_roots() -> list[tuple[str, str]]:
+    home = os.path.expanduser("~")
+    roaming = os.environ.get("APPDATA", "")
+    roots = [
+        ("Safari", os.path.join(roaming, "Apple Computer", "Safari")),
+        ("Safari", os.path.join(home, "Library", "Safari")),
+    ]
+    return [(browser, path) for browser, path in roots if path and os.path.isdir(path)]
+
+
+def detect_local_browser_profiles() -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+
+    for browser_name, root in _chromium_roots():
+        profile_dirs = []
+        if os.path.exists(os.path.join(root, "Preferences")):
+            profile_dirs.append(root)
+        try:
+            for name in sorted(os.listdir(root)):
+                path = os.path.join(root, name)
+                if not os.path.isdir(path):
+                    continue
+                if os.path.exists(os.path.join(path, "Preferences")):
+                    profile_dirs.append(path)
+        except OSError:
+            continue
+
+        seen: set[str] = set()
+        for profile_path in profile_dirs:
+            if profile_path in seen:
+                continue
+            seen.add(profile_path)
+            profile_name = os.path.basename(profile_path)
+            if os.path.abspath(profile_path) == os.path.abspath(root):
+                profile_name = "Default"
+            sources.append({
+                "id": _source_id(browser_name, "chromium", root, profile_path),
+                "browser": browser_name,
+                "engine": "chromium",
+                "profile": profile_name,
+                "root": root,
+                "path": profile_path,
+                "compatible": True,
+                "has_sessions": _profile_has_sessions(profile_path),
+                "recommended_name": sanitize_profile_name(f"{browser_name.lower()}_{profile_name.lower()}"),
+                "note": "Can be imported into the agent Chromium profile. Close the source browser first for best cookie/session transfer.",
+            })
+
+    for browser_name, root in _firefox_roots():
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.isdir(path) and os.path.exists(os.path.join(path, "prefs.js")):
+                sources.append({
+                    "id": _source_id(browser_name, "firefox", root, path),
+                    "browser": browser_name,
+                    "engine": "firefox",
+                    "profile": name,
+                    "root": root,
+                    "path": path,
+                    "compatible": False,
+                    "has_sessions": os.path.exists(os.path.join(path, "cookies.sqlite")),
+                    "recommended_name": sanitize_profile_name(f"firefox_{name}"),
+                    "note": "Detected, but not directly importable because this agent runs Chromium, not Firefox.",
+                })
+
+    for browser_name, root in _safari_roots():
+        sources.append({
+            "id": _source_id(browser_name, "safari", root, root),
+            "browser": browser_name,
+            "engine": "safari",
+            "profile": "Default",
+            "root": root,
+            "path": root,
+            "compatible": False,
+            "has_sessions": os.path.exists(os.path.join(root, "Cookies", "Cookies.binarycookies")),
+            "recommended_name": "safari_default",
+            "note": "Detected, but not directly importable because this agent runs Chromium, not Safari/WebKit.",
+        })
+
+    sources.sort(key=lambda item: (not item["compatible"], item["browser"].lower(), item["profile"].lower()))
+    return sources
+
+
+def _copy_profile_tree(source: str, destination: str) -> tuple[int, list[str]]:
+    skip_dirs = {
+        "Cache", "Code Cache", "GPUCache", "DawnCache", "GrShaderCache", "ShaderCache",
+        "Crashpad", "BrowserMetrics", "OptimizationGuidePredictionModels",
+        "Safe Browsing", "component_crx_cache", "pnacl", "SwReporter",
+    }
+    skip_files = {"DevToolsActivePort", "lockfile", ".lock"}
+    copied = 0
+    errors: list[str] = []
+
+    for dirpath, dirnames, filenames in os.walk(source):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        rel_dir = os.path.relpath(dirpath, source)
+        target_dir = destination if rel_dir == "." else os.path.join(destination, rel_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        for filename in filenames:
+            if filename in skip_files or filename.startswith("Singleton"):
+                continue
+            src = os.path.join(dirpath, filename)
+            dst = os.path.join(target_dir, filename)
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+            except Exception as exc:
+                if len(errors) < 12:
+                    errors.append(f"{os.path.relpath(src, source)}: {exc}")
+    return copied, errors
+
+
+@app.get("/profiles/sources")
+async def profile_sources():
+    """Detect browser profiles available on this computer."""
+    return {"sources": detect_local_browser_profiles()}
+
+
+@app.post("/profiles/import")
+async def import_profile(body: dict):
+    source_id = str((body or {}).get("source_id", "")).strip()
+    target_name = sanitize_profile_name(str((body or {}).get("target_name", "") or "imported"))
+    overwrite = bool((body or {}).get("overwrite", False))
+    use_after_import = bool((body or {}).get("use_after_import", False))
+
+    sources = detect_local_browser_profiles()
+    source = next((item for item in sources if item["id"] == source_id), None)
+    if not source:
+        raise HTTPException(status_code=404, detail="Browser profile source was not found. Refresh detected profiles and try again.")
+    if not source.get("compatible"):
+        raise HTTPException(status_code=400, detail=source.get("note") or "This browser profile is not compatible with the agent Chromium profile.")
+
+    cfg = load_config()
+    active_name = cfg.get("browser_profile", "default")
+    if target_name == active_name:
+        raise HTTPException(status_code=400, detail="Import into a new or inactive project profile. The active browser profile is open while the backend is running.")
+
+    profiles_dir = browser_profiles_dir()
+    destination = os.path.join(profiles_dir, target_name)
+    if os.path.exists(destination):
+        if not overwrite:
+            raise HTTPException(status_code=409, detail=f'Project profile "{target_name}" already exists. Enable overwrite or choose another name.')
+        shutil.rmtree(destination)
+    os.makedirs(destination, exist_ok=True)
+
+    local_state = os.path.join(source["root"], "Local State")
+    if os.path.isfile(local_state):
+        try:
+            shutil.copy2(local_state, os.path.join(destination, "Local State"))
+        except Exception:
+            pass
+
+    destination_default = os.path.join(destination, "Default")
+    copied, errors = _copy_profile_tree(source["path"], destination_default)
+
+    if use_after_import:
+        cfg["browser_profile"] = target_name
+        save_config(cfg)
+
+    return {
+        "status": "imported",
+        "name": target_name,
+        "path": destination,
+        "source": source,
+        "copied_files": copied,
+        "errors": errors,
+        "has_sessions": _profile_has_sessions(destination),
+        "note": "Restart the backend to use the imported profile." if use_after_import else "Switch to this profile and restart the backend to use it.",
+    }
+
+
 @app.post("/profiles/switch")
 async def switch_profile(body: dict):
     """Switch to a different profile (takes effect on next backend restart)."""
-    name = body.get("name", "default")
-    # Sanitise: only allow alphanumeric + dash/underscore
-    import re as _re
-    name = _re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:32]
+    name = sanitize_profile_name(body.get("name", "default"), "default")
     cfg = load_config()
     cfg["browser_profile"] = name
     save_config(cfg)
@@ -3340,8 +4035,7 @@ async def switch_profile(body: dict):
 @app.post("/profiles/clear")
 async def clear_profile(body: dict):
     """Delete all saved session data for a profile (logs the user out everywhere)."""
-    import shutil
-    name = body.get("name", load_config().get("browser_profile", "default"))
+    name = sanitize_profile_name(body.get("name", load_config().get("browser_profile", "default")), "default")
     profile_dir = os.path.join(BASE_DIR, "profiles", name)
     if os.path.exists(profile_dir):
         shutil.rmtree(profile_dir)
@@ -3434,15 +4128,65 @@ async def get_screenshot():
     img = await screenshot_b64()
     ctx = await extract_page_content(page,{"max_text_chars":500,"ocr_enabled":False,
                                             "pdf_enabled":False,"deep_read":False})
-    return {"screenshot":img,"url":ctx.get("url"),"title":ctx.get("title")}
+    return {"screenshot":img,"url":ctx.get("url"),"title":ctx.get("title"),
+            "control_owner":control_owner,"agent_running":agent_running}
+
+
+@app.get("/computer/state")
+async def computer_state():
+    """Return shared-browser state for reconnecting clients."""
+    ctx = await extract_page_content(page, {"max_text_chars": 200, "ocr_enabled": False,
+                                             "pdf_enabled": False, "deep_read": False})
+    return {
+        "control_owner": control_owner,
+        "agent_running": agent_running,
+        "url": ctx.get("url"),
+        "title": ctx.get("title"),
+        "profile": load_config().get("browser_profile", "default"),
+    }
+
+
+@app.post("/computer/take-control")
+async def take_computer_control():
+    """Pause automation and hand the persistent browser to the user."""
+    global control_owner, control_generation
+    control_owner = "human"
+    control_generation += 1
+    agent_control_event.clear()
+    await broadcast({
+        "type": "control_state",
+        "owner": control_owner,
+        "agent_running": agent_running,
+        "message": "You have control of the browser.",
+    })
+    return {"status": "ok", "control_owner": control_owner, "agent_running": agent_running}
+
+
+@app.post("/computer/resume-agent")
+async def resume_computer_agent():
+    """Return control and make the agent re-inspect current page state."""
+    global control_owner, control_generation
+    control_owner = "agent"
+    control_generation += 1
+    agent_control_event.set()
+    img = await screenshot_b64()
+    ctx = await extract_page_content(page, {"max_text_chars": 500, "ocr_enabled": False,
+                                             "pdf_enabled": False, "deep_read": False})
+    await broadcast({
+        "type": "control_state",
+        "owner": control_owner,
+        "agent_running": agent_running,
+        "message": "Agent control restored; browser state will be re-read.",
+    })
+    await broadcast({"type": "screenshot", "data": img,
+                     "url": ctx.get("url"), "title": ctx.get("title")})
+    return {"status": "ok", "control_owner": control_owner, "agent_running": agent_running}
 
 @app.post("/start")
 async def start_agent(body: dict):
     global agent_running, agent_task
     if agent_task and not agent_task.done():
-        agent_running = False; agent_task.cancel()
-        try: await asyncio.sleep(0.5)
-        except Exception: pass
+        raise HTTPException(status_code=409, detail="A bot task is already running. Stop it or wait for it to finish.")
     cfg = load_config()
     for k in ("max_steps_enabled","max_steps","max_time_enabled","max_time_minutes",
                "stuck_detection","stuck_threshold","fallback_enabled",
@@ -3458,28 +4202,46 @@ async def start_agent(body: dict):
     cfg["active_provider"] = selected_provider
     cfg["active_model"] = selected_model
     save_config(cfg)
-    agent_task = asyncio.create_task(run_agent(
-        body.get("goal",""),
+    goal = str(body.get("goal", "")).strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail="A goal is required to start the agent.")
+    bot_id = str(body.get("bot_id") or "primary")
+    if not bot_registry.get(bot_id):
+        raise HTTPException(status_code=404, detail="Selected bot was not found.")
+    agent_task = asyncio.create_task(run_agent_guarded(
+        goal,
         selected_provider,
         selected_model,
         cfg,
         body.get("auto_restart", False),
         body.get("restart_goal",""),
         body.get("attachments", []) or [],
+        bot_id=bot_id,
     ))
-    return {"status":"started"}
+    return {"status":"started", "bot_id": bot_id}
 
 @app.post("/stop")
 async def stop_agent():
-    global agent_running; agent_running = False; return {"status":"stopping"}
+    global agent_running, control_owner
+    agent_running = False
+    control_owner = "human"
+    agent_control_event.set()
+    return {"status":"stopping"}
 
 @app.post("/manual")
 async def manual_action(body: dict):
-    result     = await execute_action(body, from_manual=True)
+    if agent_running and control_owner != "human":
+        raise HTTPException(status_code=409, detail="Take control before interacting with the running browser.")
+    async with browser_input_lock:
+        result = await execute_action(body, from_manual=True)
     screenshot = await screenshot_b64()
     ctx        = await extract_page_content(page,{"max_text_chars":500,"ocr_enabled":False,
                                                    "pdf_enabled":False,"deep_read":False})
-    return {"result":result,"screenshot":screenshot,"url":ctx.get("url"),"title":ctx.get("title")}
+    payload = {"result":result,"screenshot":screenshot,"url":ctx.get("url"),"title":ctx.get("title"),
+               "control_owner":control_owner}
+    await broadcast({"type":"screenshot","data":screenshot,
+                     "url":ctx.get("url"),"title":ctx.get("title")})
+    return payload
 
 
 @app.post("/inject")
@@ -3507,10 +4269,15 @@ async def force_replan():
 
 
 @app.get("/tasks")
-async def get_tasks():
+async def get_tasks(bot_id: str = "primary"):
     """Get current task plan state."""
-    if current_tracker:
+    if current_tracker and bot_id == current_bot_id:
         return current_tracker.to_dict()
+    workspace = _workspace_payload(bot_id)
+    if workspace["tasks"]:
+        return {"tasks": workspace["tasks"], "goal": workspace["goal"],
+                "complete": all(task.get("status") in ("completed", "skipped") for task in workspace["tasks"]),
+                "progress": workspace["progress"]}
     return {"tasks": [], "goal": "", "complete": False, "progress": "0/0"}
 
 
@@ -3518,14 +4285,19 @@ async def get_tasks():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     if ws not in active_ws: active_ws.append(ws)
-    img = await screenshot_b64()
-    ctx = await extract_page_content(page,{"max_text_chars":500,"ocr_enabled":False,
-                                            "pdf_enabled":False,"deep_read":False})
-    await ws.send_json({"type":"screenshot","data":img,
-                        "url":ctx.get("url"),"title":ctx.get("title")})
     try:
-        while True: await ws.receive_text()
-    except WebSocketDisconnect:
+        img = await screenshot_b64()
+        ctx = await extract_page_content(page,{"max_text_chars":500,"ocr_enabled":False,
+                                                "pdf_enabled":False,"deep_read":False})
+        await ws.send_json({"type":"screenshot","data":img,
+                            "url":ctx.get("url"),"title":ctx.get("title")})
+        await ws.send_json({"type":"control_state","owner":control_owner,
+                            "agent_running":agent_running})
+        while True:
+            await ws.receive_text()
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
         if ws in active_ws: active_ws.remove(ws)
 
 if __name__ == "__main__":
