@@ -1,31 +1,63 @@
-# AI Browser Agent
+# Eiomra Agent
 
-AI Browser Agent is a local web automation app that pairs a language model with a real Chromium browser. The backend uses FastAPI, Playwright, and your configured model provider; the frontend provides a live control panel for goals, browser state, screenshots, and manual actions.
+Eiomra Agent is a local-first browser and computer automation workspace. It combines a FastAPI backend, a persistent Playwright Chromium session, and a React dashboard so an AI bot and its user can observe and control the same browser.
 
-The project is designed for local-first use. It can run with Ollama on your machine, and it also includes optional configuration for cloud providers.
+The application supports local Ollama models by default and can also use Ollama Cloud, Google Gemini, or OpenAI-compatible models when configured.
 
 ## Features
 
-- Autonomous browser navigation with Playwright Chromium
-- Goal-based agent loop with page text, URL, title, screenshot, and element context
-- Manual browser controls for navigation, clicking, typing, scrolling, and key presses
-- Local Ollama support by default
-- Optional OpenAI, Google Gemini, and Ollama Cloud configuration
-- Session logs, result files, browser profiles, and uploaded attachments stored locally
-- OCR and PDF support through optional Python/system dependencies
-- Windows and Linux launch scripts, plus manual setup for macOS
+- Structured goal planning with live task status, findings, replanning, and final reports
+- Interactive bot computer with clicking, typing, navigation, keyboard input, buttons, and mouse-wheel scrolling
+- Take Control / Resume Agent arbitration so the user and bot never drive the browser simultaneously
+- Persistent Chromium profiles, cookies, task plans, histories, settings, and bot workspaces
+- Automatic recovery of interrupted tasks after the backend or computer restarts
+- Multiple selectable bot workspaces with individual task history and saved computer state
+- Ollama request queue with configurable pacing, retries, and exponential rate-limit backoff
+- Local file reading, writing, reports, archives, downloads, OCR, PDF extraction, and command tools
+- User-requested summary, findings, notes, and report files finalized from the complete session report
+- Responsive dashboard for Home, Bots, Tasks, Computer, Activity, Results, Profiles, and Settings
+- Optional external desktop automation on Windows and Linux
+
+Bot workspaces are durable and individually viewable. Automation runs are currently serialized through one local Chromium worker to prevent conflicting browser input.
 
 ## Requirements
+
+Required software:
 
 - Python 3.10 or newer
 - Node.js 18 or newer
 - npm
-- Ollama, if you want to use local models
+- A supported model provider
 
-Optional:
+For local inference, install [Ollama](https://ollama.com/). Cloud providers only require their corresponding API credentials.
 
-- Tesseract OCR for OCR-enabled image or screen reading
-- Linux desktop tools for desktop automation: `xdotool`, `wmctrl`, and `gnome-screenshot` or `scrot`
+### Installed Python libraries
+
+`backend/requirements.txt` installs:
+
+- FastAPI and Uvicorn
+- Playwright and Greenlet
+- HTTPX
+- python-multipart
+- Pillow and pytesseract
+- PyMuPDF
+- PyYAML
+
+The frontend uses React, React DOM, and Vite from `frontend/package.json`. No separate UI or icon library is required.
+
+After installing Python packages, Playwright Chromium must also be installed:
+
+```bash
+python -m playwright install chromium
+```
+
+### Optional system software
+
+- **Tesseract OCR:** required only for OCR features. On Windows, set `TESSERACT_CMD` if it is not detected automatically.
+- **Linux desktop automation:** install `xdotool`, `wmctrl`, and either `gnome-screenshot` or `scrot`.
+- **Ollama:** required only for local Ollama models.
+
+No additional library is required for the bot registry, persistent task restoration, report-file synchronization, or bot avatar.
 
 ## Quick Start
 
@@ -37,11 +69,7 @@ Run:
 START.bat
 ```
 
-The script installs backend dependencies, installs Playwright Chromium, installs frontend dependencies, starts both services, and opens the app at:
-
-```text
-http://localhost:3000
-```
+The script installs Python dependencies, Playwright Chromium, and frontend dependencies before starting both services.
 
 ### Linux
 
@@ -52,11 +80,15 @@ chmod +x start.sh
 ./start.sh
 ```
 
-The script installs dependencies, starts the backend and frontend, and opens the app when `xdg-open` is available.
+For optional Linux desktop control, install the system packages first. For example on Ubuntu/Debian:
+
+```bash
+sudo apt install xdotool wmctrl scrot tesseract-ocr
+```
 
 ### macOS
 
-macOS can run the main web-agent workflow manually:
+Start the backend:
 
 ```bash
 cd backend
@@ -65,7 +97,7 @@ python3 -m playwright install chromium
 python3 agent.py
 ```
 
-In a second terminal:
+Start the frontend in a second terminal:
 
 ```bash
 cd frontend
@@ -73,17 +105,11 @@ npm install
 npm run dev
 ```
 
-Then open:
-
-```text
-http://localhost:3000
-```
-
-Note: macOS desktop automation is not fully implemented yet. The browser agent itself should work, but OS-level app control currently has Windows and Linux-specific support.
+macOS supports the main browser-agent workflow, but external OS-level desktop automation is currently focused on Windows and Linux.
 
 ## Manual Setup
 
-Install and start the backend:
+Backend:
 
 ```bash
 cd backend
@@ -92,7 +118,7 @@ python -m playwright install chromium
 python agent.py
 ```
 
-Install and start the frontend in another terminal:
+Frontend, in another terminal:
 
 ```bash
 cd frontend
@@ -100,71 +126,66 @@ npm install
 npm run dev
 ```
 
-Open:
-
-```text
-http://localhost:3000
-```
-
-The backend listens on:
-
-```text
-http://localhost:8765
-ws://localhost:8765/ws
-```
+Open `http://localhost:3000`. The backend listens on `http://localhost:8765`, and live events use `ws://localhost:8765/ws`.
 
 ## Ollama Setup
 
-Install Ollama from the official website, then start the Ollama service:
+Start Ollama and pull a model:
 
 ```bash
 ollama serve
-```
-
-Pull a model:
-
-```bash
 ollama pull qwen3:4b
 ```
 
-Recommended local models:
+Suggested local models:
 
-| Model | Approx. RAM | Notes |
+| Model | Approximate RAM | Notes |
 | --- | ---: | --- |
-| `qwen3:4b` | 4 GB | Fast default choice |
+| `qwen3:4b` | 4 GB | Fast local default |
 | `qwen3:8b` | 8 GB | Better reasoning, slower |
 | `gemma3:4b` | 4 GB | Lightweight alternative |
 
+Ollama requests are queued by default. Queue pacing, retry count, and restart recovery can be changed from Settings.
+
 ## Usage
 
-Start the app, choose a model, and enter a goal such as:
+Choose a bot, provider, and model, then enter a task such as:
 
-- Search for the weather in Lagos, Nigeria
-- Go to Wikipedia and summarize an article about space
-- Find recent AI news and produce a short summary
-- Open a site and extract key information
+- Research a company and save a detailed report in a specified folder
+- Open a site, collect key information, and create a structured text file
+- Review an uploaded PDF or image and summarize its contents
+- Use the shared browser, take manual control for login or 2FA, then resume the agent
 
-The agent can navigate, click, type, press keys, scroll, wait, go back, and stop when it believes the goal is complete.
+When a task requests a summary, findings, notes, or report file, Eiomra first gathers the information and then synchronizes the completed final report into that requested file.
 
 ## Configuration
 
-Runtime configuration is stored in:
-
-```text
-backend/config.json
-```
-
+Runtime configuration is stored locally in `backend/config.json`. It is created when settings are saved and is excluded from Git because it may contain provider URLs and API keys.
 
 Important settings include:
 
-- `active_provider`
-- `active_model`
-- `ollama_local_url`
-- `google_api_key`
-- `openai_api_key`
+- `active_provider` and `active_model`
+- `ollama_local_url` and `ollama_cloud_url`
+- `ollama_queue_enabled`
+- `ollama_queue_min_interval_seconds`
+- `ollama_queue_max_retries`
+- `ollama_queue_backoff_seconds`
+- `resume_incomplete_on_startup`
+- `filesystem_scope` and `filesystem_root`
 - `desktop_automation_enabled`
 - `command_execution_mode`
-- `filesystem_scope`
+
+## Persistent Data
+
+The following local data is generated at runtime and excluded from Git:
+
+- Browser profiles and cookies
+- Bot registry and bot screenshots
+- Session checkpoints and task histories
+- Results, logs, uploads, memory, and artifacts
+- API keys and local configuration
+
+Completed and interrupted session records allow the interface to restore tasks after a refresh and resume eligible work after a backend restart.
 
 ## Project Structure
 
@@ -172,13 +193,17 @@ Important settings include:
 .
 |-- backend/
 |   |-- agent.py
-|   |-- requirements.txt
+|   |-- agent_sessions.py
+|   |-- bot_registry.py
+|   |-- task_planner.py
 |   |-- workspace_actions.py
-|   |-- desktop_automation.py
-|   `-- desktop_automation_portable.py
+|   `-- requirements.txt
 |-- frontend/
 |   |-- src/
-|   |-- index.html
+|   |   |-- App.jsx
+|   |   |-- NexusShell.jsx
+|   |   |-- App.css
+|   |   `-- assets/
 |   |-- package.json
 |   `-- vite.config.js
 |-- START.bat
@@ -186,36 +211,40 @@ Important settings include:
 `-- README.md
 ```
 
-Generated runtime folders such as logs, results, sessions, uploads, browser profiles, and artifacts are excluded from Git.
-
 ## API Overview
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
 | `GET` | `/models` | List configured model options |
-| `GET` | `/screenshot` | Return current browser screenshot and page metadata |
-| `POST` | `/start` | Start an agent run |
-| `POST` | `/stop` | Stop the active agent run |
+| `GET/POST` | `/config` | Read or update safe configuration values |
+| `GET` | `/bots` | List persistent bot workspaces |
+| `POST` | `/bots` | Create a bot workspace |
+| `GET` | `/workspace/state` | Restore a bot's tasks, session, and computer state |
+| `GET` | `/tasks` | Read the current or saved task plan |
+| `GET` | `/screenshot` | Return the live browser screenshot and metadata |
+| `GET` | `/computer/state` | Read shared-computer ownership and status |
+| `POST` | `/computer/take-control` | Pause the bot and hand browser input to the user |
+| `POST` | `/computer/resume-agent` | Return control and make the bot re-read the page |
+| `POST` | `/start` | Start a bot task |
+| `POST` | `/stop` | Stop the active task |
 | `POST` | `/manual` | Execute a manual browser action |
-| `GET` | `/config` | Read safe configuration values |
-| `POST` | `/config` | Update configuration |
-| `WS` | `/ws` | Stream live browser updates |
+| `WS` | `/ws` | Stream screenshots, task events, and activity |
 
 ## Privacy and Security
 
-- Local Ollama inference stays on your machine.
-- Cloud provider use depends on your configuration and sends prompts/context to that provider.
-- Browser profiles, logs, uploaded files, results, and config files may contain sensitive data and are ignored by Git.
-- Review generated actions before enabling automatic command or desktop execution.
+- Local Ollama inference remains on your machine.
+- Cloud providers receive the prompt and context required for the selected task.
+- Browser profiles, logs, uploads, results, generated files, and configuration may contain sensitive information.
+- Keep the generated runtime directories ignored and review permissions before enabling full-computer filesystem access, commands, or desktop automation.
+- Use Take Control for credentials, CAPTCHA, 2FA, and other sensitive manual steps.
 
 ## Troubleshooting
 
-If the frontend fails after copying the project between operating systems, reinstall frontend dependencies:
+If frontend dependencies were copied from another operating system, reinstall them:
 
 ```bash
 cd frontend
-rm -rf node_modules package-lock.json
-npm install
+npm install --include=optional
 ```
 
 If Playwright cannot launch Chromium:
@@ -225,4 +254,6 @@ cd backend
 python -m playwright install chromium
 ```
 
-If OCR is unavailable, install Tesseract and make sure the executable is available on your system path or configured through your environment.
+If OCR is unavailable, install the Tesseract binary and ensure it is on the system path or set `TESSERACT_CMD`.
+
+If the frontend reports that the backend is offline, confirm that port `8765` is listening and that `python agent.py` is still running.

@@ -41,6 +41,9 @@ backend/results/
 backend/sessions/
 backend/uploads/
 backend/memory/
+backend/bot_snapshots/
+backend/bots.json
+backend/*.tmp
 backend/profiles/
 backend/profile/
 backend/profilem/
@@ -53,6 +56,10 @@ test-results/
 # Local extension workspace not included in this repository
 eiomra-nexus/
 
+# Local design references and generated exports
+new-design/
+extracted_contacts.json
+
 # Editor and tooling
 .idea/
 .vscode/*
@@ -63,4 +70,3 @@ eiomra-nexus/
 
 # Logs
 *.log
-
