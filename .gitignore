@@ -70,3 +70,6 @@ extracted_contacts.json
 
 # Logs
 *.log
+
+# Gmail OAuth refresh/access credentials
+backend/gmail_tokens.json
