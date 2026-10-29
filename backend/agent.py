@@ -5,11 +5,12 @@ Multi-provider AI + structured task planning + rich page extraction
 
 import asyncio, base64, hashlib, json, os, re, shutil, sys, time, traceback
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 import httpx, uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 
@@ -37,6 +38,11 @@ from desktop_automation_portable import (
     select_menu_item_action,
 )
 from page_reader  import extract_page_content, get_capabilities, rank_candidates, format_candidates
+from gmail_integration import GmailConnector, make_router
+from gmail_tool_calls import (
+    openai_tools, gemini_tools, anthropic_tools,
+    from_openai_message, from_ollama_message, from_gemini_response, from_anthropic_response,
+)
 from action_protocol import action_to_history_entry, normalize_action_payload
 from agent_sessions import AgentOrchestrator, AgentSessionStore
 from bot_registry import BotRegistry
@@ -83,8 +89,21 @@ from task_planner import (
 )
 
 app = FastAPI(title="AI Browser Agent")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+# Local workspace: refuse arbitrary browser origins instead of wildcard CORS.
+TRUSTED_BROWSER_ORIGINS = {
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:8765", "http://127.0.0.1:8765",
+}
+app.add_middleware(CORSMiddleware, allow_origins=sorted(TRUSTED_BROWSER_ORIGINS),
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def reject_cross_origin_posts(request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in TRUSTED_BROWSER_ORIGINS:
+        return __import__("fastapi").responses.JSONResponse(
+            {"detail": "Untrusted browser origin."}, status_code=403)
+    return await call_next(request)
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_ROOT = os.path.dirname(BASE_DIR)
@@ -95,6 +114,9 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 MEMORY_DIR = os.path.join(BASE_DIR, "memory")
 BOT_SNAPSHOTS_DIR = os.path.join(BASE_DIR, "bot_snapshots")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+gmail_storage = Path(os.environ.get("EIOMRA_GMAIL_STATE_DIR") or (Path.home() / ".eiomra" / "secrets"))
+gmail_service = GmailConnector(gmail_storage / "gmail_tokens.enc")
+app.include_router(make_router(gmail_service))
 BOT_REGISTRY_FILE = os.path.join(BASE_DIR, "bots.json")
 for d in (RESULTS_DIR, LOGS_DIR, SESSIONS_DIR, UPLOADS_DIR, MEMORY_DIR, BOT_SNAPSHOTS_DIR): os.makedirs(d, exist_ok=True)
 
@@ -315,96 +337,106 @@ def _make_image_part_google(b64: str) -> dict:
 
 async def call_provider(provider, model, system_prompt, user_prompt, cfg,
                         image_b64: str | None = None) -> str:
-    """Call a model provider.  If *image_b64* is set, include the screenshot
-    as a vision input so the model can see the current screen state."""
-
-    if provider == "ollama_local":
-        url = cfg["ollama_local_url"].rstrip("/") + "/api/chat"
-        user_msg: dict = {"role": "user", "content": user_prompt}
-        if image_b64:
-            user_msg["images"] = [image_b64]
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url, json={
-                "model": model,
-                "messages": [{"role": "system", "content": system_prompt}, user_msg],
-                "stream": False,
-                "options": {"temperature": 0.2, "num_ctx": 8192}
-            })
-            r.raise_for_status()
-            return r.json()["message"]["content"].strip()
-
-    elif provider == "ollama_cloud":
-        if not cfg.get("ollama_cloud_key"): raise ValueError("Ollama Cloud key not set")
-        url = cfg["ollama_cloud_url"].rstrip("/") + "/chat"
+    """Invoke an LLM, translating native Gmail tool calls into agent actions."""
+    tracker = globals().get("current_tracker")
+    goal = str(getattr(tracker, "goal", "") or "")
+    gmail_tools = (
+        system_prompt == EXECUTOR_SYSTEM
+        and bool(re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal))
+        and gmail_service.status()["connected"]
+        and gmail_service.agent_allowed
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    if provider in {"ollama_local", "ollama_cloud"}:
         user_msg = {"role": "user", "content": user_prompt}
         if image_b64:
             user_msg["images"] = [image_b64]
+        messages.append(user_msg)
+        is_local = provider == "ollama_local"
+        if is_local:
+            url = cfg["ollama_local_url"].rstrip("/") + "/api/chat"
+            headers = {}
+        else:
+            if not cfg.get("ollama_cloud_key"):
+                raise ValueError("Ollama Cloud key not set")
+            url = cfg["ollama_cloud_url"].rstrip("/") + "/chat"
+            headers = {"Authorization": f"Bearer {cfg['ollama_cloud_key']}"}
+        payload = {"model": model, "messages": messages, "stream": False}
+        if is_local:
+            payload["options"] = {"temperature": 0.2, "num_ctx": 8192}
+        if gmail_tools:
+            payload["tools"] = openai_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url,
-                headers={"Authorization": f"Bearer {cfg['ollama_cloud_key']}"},
-                json={"model": model,
-                      "messages": [{"role": "system", "content": system_prompt}, user_msg],
-                      "stream": False})
+            r = await c.post(url, headers=headers, json=payload)
             r.raise_for_status()
-            return r.json()["message"]["content"].strip()
+        message = r.json()["message"]
+        return (from_ollama_message(message) if gmail_tools else None) or (message.get("content") or "").strip()
 
-    elif provider == "google":
-        if not cfg.get("google_api_key"): raise ValueError("Google API key not set")
+    if provider == "google":
+        if not cfg.get("google_api_key"):
+            raise ValueError("Google API key not set")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        parts: list = [{"text": f"{system_prompt}\n\n{user_prompt}"}]
+        parts = [{"text": f"{system_prompt}\n\n{user_prompt}"}]
         if image_b64:
             parts.insert(0, _make_image_part_google(image_b64))
+        payload = {"contents": [{"role": "user", "parts": parts}],
+                   "generationConfig": {"temperature": 0.2}}
+        if gmail_tools:
+            payload["tools"] = gemini_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url,
-                headers={"x-goog-api-key": cfg["google_api_key"],
-                         "Content-Type": "application/json"},
-                json={"contents": [{"role": "user", "parts": parts}],
-                      "generationConfig": {"temperature": 0.2}})
+            r = await c.post(url, headers={"x-goog-api-key": cfg["google_api_key"],
+                                          "Content-Type": "application/json"}, json=payload)
             r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = r.json()
+        native = from_gemini_response(data) if gmail_tools else None
+        if native:
+            return native
+        response_parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts") or []
+        return next((part["text"].strip() for part in response_parts if part.get("text")), "")
 
-    elif provider == "openai":
-        if not cfg.get("openai_api_key"): raise ValueError("OpenAI key not set")
-        if image_b64:
-            user_content: list | str = [
-                {"type": "text", "text": user_prompt},
-                _make_image_part_openai(image_b64),
-            ]
-        else:
-            user_content = user_prompt
+    if provider == "openai":
+        if not cfg.get("openai_api_key"):
+            raise ValueError("OpenAI key not set")
+        content = ([{"type": "text", "text": user_prompt},
+                    _make_image_part_openai(image_b64)] if image_b64 else user_prompt)
+        messages.append({"role": "user", "content": content})
+        payload = {"model": model, "temperature": 0.2, "messages": messages}
+        if gmail_tools:
+            payload.update({"tools": openai_tools(), "tool_choice": "auto"})
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
             r = await c.post("https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {cfg['openai_api_key']}",
-                         "Content-Type": "application/json"},
-                json={"model": model, "temperature": 0.2,
-                      "messages": [{"role": "system", "content": system_prompt},
-                                    {"role": "user",   "content": user_content}]})
+                             headers={"Authorization": f"Bearer {cfg['openai_api_key']}",
+                                      "Content-Type": "application/json"},
+                             json=payload)
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+        message = r.json()["choices"][0]["message"]
+        return (from_openai_message(message) if gmail_tools else None) or (message.get("content") or "").strip()
 
-    elif provider == "anthropic":
-        if not cfg.get("anthropic_api_key"): raise ValueError("Anthropic key not set")
-        if image_b64:
-            user_content = [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                {"type": "text", "text": user_prompt},
-            ]
-        else:
-            user_content = user_prompt
+    if provider == "anthropic":
+        if not cfg.get("anthropic_api_key"):
+            raise ValueError("Anthropic key not set")
+        content = ([{"type": "image", "source": {"type": "base64",
+                    "media_type": "image/jpeg", "data": image_b64}},
+                    {"type": "text", "text": user_prompt}] if image_b64 else user_prompt)
+        payload = {"model": model, "max_tokens": 4096, "temperature": 0.2,
+                   "system": system_prompt, "messages": [{"role": "user", "content": content}]}
+        if gmail_tools:
+            payload["tools"] = anthropic_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
             r = await c.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": cfg["anthropic_api_key"],
-                         "anthropic-version": "2023-06-01",
-                         "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": 4096, "temperature": 0.2,
-                      "system": system_prompt,
-                      "messages": [{"role": "user", "content": user_content}]})
+                             headers={"x-api-key": cfg["anthropic_api_key"],
+                                      "anthropic-version": "2023-06-01",
+                                      "Content-Type": "application/json"},
+                             json=payload)
             r.raise_for_status()
-            return r.json()["content"][0]["text"].strip()
+        data = r.json()
+        native = from_anthropic_response(data) if gmail_tools else None
+        if native:
+            return native
+        return next((item["text"].strip() for item in data.get("content", [])
+                     if item.get("type") == "text"), "")
 
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
+    raise ValueError(f"Unknown provider: {provider}")
 
 _provider_request_locks: dict[str, asyncio.Lock] = {}
 _provider_last_request_at: dict[str, float] = {}
@@ -653,9 +685,14 @@ async def run_command_streaming_action(request, timeout: int = 120) -> str:
         "timeout": timeout,
     })
 
+    # Keep OAuth credentials, encryption keys and owner passwords out of
+    # subprocess environment (including agent-generated shell commands).
+    safe_env = {key: value for key, value in os.environ.items()
+                if not key.startswith("EIOMRA_GMAIL_")}
     process = await asyncio.create_subprocess_shell(
         request.command,
         cwd=request.resolved_cwd,
+        env=safe_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1271,9 +1308,28 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
     act    = action.get("action", "")
     params = {k:v for k,v in action.items()
               if k not in ("action","thought","summary","task_id","finding","reason")}
+    # Do not copy private mail content into condensed action logs.
+    if act.startswith("gmail_"):
+        params = {k: ("<redacted>" if k in {"body", "query"} else v) for k, v in params.items()}
     if session_log: session_log.action(act, params)
     try:
         cfg = load_config()
+        # Tool calls generated from untrusted pages must not obtain Gmail access
+        # unless the user's original goal explicitly requests email work.
+        if act.startswith("gmail_") and from_manual:
+            return "Gmail tools must use the authenticated Gmail Settings API, not generic manual actions."
+        if act.startswith("gmail_") and not from_manual:
+            if not gmail_service.agent_allowed:
+                return "Gmail actions are locked. Unlock Gmail in Settings and start a new task."
+            goal = str(getattr(globals().get("current_tracker"), "goal", "") or "")
+            if not re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal):
+                return "Gmail tool blocked: the original user goal did not authorize email access."
+            if act in {"gmail_send", "gmail_queue_send", "gmail_queue_reply", "gmail_create_draft"}:
+                if not re.search(r"(?i)\b(send|compose|draft|write|reply|respond|answer)\b", goal):
+                    return "Gmail compose blocked: the user did not ask to write or send email."
+            if act == "gmail_modify_labels":
+                if not re.search(r"(?i)\b(mark|archive|organize|label|star|move|sort|categorize)\b", goal):
+                    return "Gmail mailbox modification blocked: the user did not request mailbox changes."
 
         def _resolve_upload_paths(single_path: str = "", multiple_paths: list[str] | None = None) -> list[str]:
             if not cfg.get("local_file_access_enabled", True):
@@ -1307,7 +1363,41 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
                             "desktop_execution_mode=manual. Use manual mode if desired.")
             return None
 
-        if act == "open_application":
+        if act == "gmail_search":
+            data = await gmail_service.search(str(action.get("query", "")), int(action.get("limit", 5)))
+            result = json.dumps(data, ensure_ascii=False)
+
+        elif act == "gmail_read":
+            data = await gmail_service.read(str(action.get("message_id", "")))
+            result = json.dumps(data, ensure_ascii=False)
+
+        elif act == "gmail_list_labels":
+            result = json.dumps(await gmail_service.list_labels(), ensure_ascii=False)
+
+        elif act == "gmail_modify_labels":
+            result = json.dumps(await gmail_service.modify_labels(
+                str(action.get("message_id", "")),
+                action.get("add_labels") or [], action.get("remove_labels") or []), ensure_ascii=False)
+
+        elif act == "gmail_create_draft":
+            result = json.dumps(await gmail_service.create_gmail_draft(
+                str(action.get("to", "")), str(action.get("subject", "")),
+                str(action.get("body", ""))), ensure_ascii=False)
+
+        elif act == "gmail_queue_reply":
+            result = json.dumps(await gmail_service.queue_reply(
+                str(action.get("message_id", "")), str(action.get("body", ""))), ensure_ascii=False)
+
+        elif act in ("gmail_send", "gmail_queue_send"):
+            draft = gmail_service.draft(
+                str(action.get("to", "")),
+                str(action.get("subject", "")),
+                str(action.get("body", "")),
+            )
+            result = ("Gmail message queued for user approval in Settings > Gmail. "
+                      "It was NOT sent. Draft ID: " + draft["id"])
+
+        elif act == "open_application":
             blocked = _desktop_policy(interactive=True)
             command = action.get("command", "")
             cwd = action.get("cwd", "")
@@ -2209,7 +2299,7 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
         result = f"Action failed: {e}"
 
     if session_log and act not in ("complete_task","skip_task","done"):
-        session_log.result(result)
+        session_log.result("[Private Gmail result omitted]" if act.startswith("gmail_") else result)
     return result
 
 
@@ -2247,6 +2337,17 @@ class StuckDetector:
         return None
 
     def reset(self): self.recent = []
+
+
+def private_history_for_storage(history: list[dict]) -> list[dict]:
+    """Keep Gmail message bodies out of routine session logs and checkpoints."""
+    safe = []
+    for entry in history:
+        item = dict(entry)
+        if str(item.get("action", "")).startswith("gmail_"):
+            item["result"] = "[Gmail content excluded from saved history]"
+        safe.append(item)
+    return safe
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2715,7 +2816,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             model=current_model,
             bot_id=current_bot_id,
             planned_tasks=tracker.to_dict()["tasks"],
-            runtime_history=history[-80:],
+            runtime_history=private_history_for_storage(history[-80:]),
         )
         bot_registry.update(current_bot_id, status="running", current_task_id=task_id,
                             current_goal=goal, last_url=context.get("url", ""),
@@ -3189,7 +3290,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 else:  session_log.error("complete_task", msg)
             history.append({"action":f"complete_task: {completed_task_id}","result":msg})
             orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
-                                      runtime_history=history[-80:])
+                                      runtime_history=private_history_for_storage(history[-80:]))
             orchestrator.append_event(task_id, "task_completed", {
                 "task_id": completed_task_id,
                 "finding": finding,
@@ -3223,7 +3324,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 else:  session_log.error("skip_task", msg)
             history.append({"action":f"skip_task: {skipped_task_id}","result":msg})
             orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
-                                      runtime_history=history[-80:])
+                                      runtime_history=private_history_for_storage(history[-80:]))
             orchestrator.append_event(task_id, "task_skipped", {
                 "task_id": skipped_task_id,
                 "reason": reason,
@@ -3281,7 +3382,8 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             "result": result
         })
         executed_actions.append({
-            "decision": dict(decision),
+            "decision": ({k: ("<redacted>" if k in {"body", "query"} else v)
+                          for k, v in decision.items()} if action.startswith("gmail_") else dict(decision)),
             "result": result,
             "task_description": cur_task.description if cur_task else "",
         })
@@ -3294,12 +3396,13 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 "press", "scroll", "read_page", "back",
             }:
                 should_remember = False
-            if should_remember:
+            if should_remember and not action.startswith("gmail_"):
                 method_memory.remember_success(goal, cur_task.description, decision, result)
         orchestrator.append_event(task_id, "action_executed", {
             "step": step,
-            "action": decision,
-            "result": result,
+            "action": ({k: ("<redacted>" if k in {"body", "query"} else v)
+                        for k, v in decision.items()} if action.startswith("gmail_") else decision),
+            "result": "[Private Gmail result omitted]" if action.startswith("gmail_") else result,
         })
 
         await asyncio.sleep(0.5)
@@ -3422,7 +3525,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
 
         filename = ""
         try:
-            fp = save_result(tracker, report, history, current_provider, current_model)
+            fp = save_result(tracker, report, private_history_for_storage(history), current_provider, current_model)
             filename = os.path.basename(fp)
         except Exception: pass
 
@@ -3439,7 +3542,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             result_filename=filename,
             final_tasks=tracker.to_dict()["tasks"],
             planned_tasks=tracker.to_dict()["tasks"],
-            runtime_history=history[-80:],
+            runtime_history=private_history_for_storage(history[-80:]),
             synced_report_artifacts=synced_report_artifacts,
         )
         orchestrator.append_event(task_id, "session_completed", {
@@ -3502,6 +3605,7 @@ async def run_agent_guarded(*args, **kwargs):
             orchestrator.set_metadata(current_session_task_id, last_error=error_message)
         bot_registry.update(current_bot_id, status="interrupted")
     finally:
+        gmail_service.agent_allowed = False
         agent_running = False
         current_session_task_id = None
 
@@ -3551,6 +3655,9 @@ async def lifespan(app):
                             if session.status == "running"
                             and session.metadata.get("resume_on_restart") is True
                             and (session.metadata.get("planned_tasks") or session.metadata.get("final_tasks"))), None)
+        if interrupted and re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", interrupted.request):
+            print("Gmail task needs owner reauthorization; automatic resume skipped.", flush=True)
+            interrupted = None
         if interrupted:
             meta = interrupted.metadata
             attachment_ids = [item.get("id") for item in meta.get("attachments", [])
@@ -4183,7 +4290,7 @@ async def resume_computer_agent():
     return {"status": "ok", "control_owner": control_owner, "agent_running": agent_running}
 
 @app.post("/start")
-async def start_agent(body: dict):
+async def start_agent(body: dict, request: Request):
     global agent_running, agent_task
     if agent_task and not agent_task.done():
         raise HTTPException(status_code=409, detail="A bot task is already running. Stop it or wait for it to finish.")
@@ -4205,6 +4312,13 @@ async def start_agent(body: dict):
     goal = str(body.get("goal", "")).strip()
     if not goal:
         raise HTTPException(status_code=400, detail="A goal is required to start the agent.")
+    gmail_goal = bool(re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal))
+    if gmail_goal and gmail_service.status()["connected"] and not gmail_service.authenticated(request):
+        raise HTTPException(status_code=401,
+                            detail="Unlock Gmail in Settings before starting an email task.")
+    # The owner grant applies only to the current task, never to generic manual
+    # actions, resumed tasks on startup or unrelated sessions.
+    gmail_service.agent_allowed = gmail_goal and gmail_service.authenticated(request)
     bot_id = str(body.get("bot_id") or "primary")
     if not bot_registry.get(bot_id):
         raise HTTPException(status_code=404, detail="Selected bot was not found.")
@@ -4223,6 +4337,7 @@ async def start_agent(body: dict):
 @app.post("/stop")
 async def stop_agent():
     global agent_running, control_owner
+    gmail_service.agent_allowed = False
     agent_running = False
     control_owner = "human"
     agent_control_event.set()
@@ -4230,6 +4345,8 @@ async def stop_agent():
 
 @app.post("/manual")
 async def manual_action(body: dict):
+    if str(body.get("action", "")).startswith("gmail_"):
+        raise HTTPException(status_code=403, detail="Use authenticated Gmail Settings endpoints.")
     if agent_running and control_owner != "human":
         raise HTTPException(status_code=409, detail="Take control before interacting with the running browser.")
     async with browser_input_lock:
@@ -4283,6 +4400,9 @@ async def get_tasks(bot_id: str = "primary"):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    if ws.headers.get("origin") not in TRUSTED_BROWSER_ORIGINS:
+        await ws.close(code=1008, reason="Untrusted browser origin")
+        return
     await ws.accept()
     if ws not in active_ws: active_ws.append(ws)
     try:
@@ -4301,7 +4421,7 @@ async def ws_endpoint(ws: WebSocket):
         if ws in active_ws: active_ws.remove(ws)
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     try:
         port = int(os.environ.get("PORT", "8765"))
     except ValueError:

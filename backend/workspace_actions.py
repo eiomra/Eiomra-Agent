@@ -55,6 +55,12 @@ def resolve_allowed_path(path_value: str, cfg: dict[str, Any], workspace_root: s
     raw_path = os.path.expandvars(os.path.expanduser(path_value.strip()))
     resolved = os.path.abspath(raw_path if os.path.isabs(raw_path) else os.path.join(base_root, raw_path))
 
+    # The agent must not read Gmail OAuth credentials through general file tools.
+    # Resolve symlinks before comparison to prevent access via aliases.
+    gmail_secrets = os.path.realpath(os.path.join(workspace_root, "backend", "gmail_tokens.json"))
+    if os.path.realpath(resolved) == gmail_secrets:
+        raise ValueError("Access to Gmail OAuth credentials is not permitted.")
+
     if scope != "full_computer":
         common = os.path.commonpath([base_root, resolved])
         if common != base_root:
@@ -67,6 +73,8 @@ def summarize_dir(path: str, limit: int = 40) -> str:
     entries = sorted(os.listdir(path))
     rows = []
     for name in entries[:limit]:
+        if name == "gmail_tokens.json" and os.path.basename(path) == "backend":
+            continue
         full = os.path.join(path, name)
         kind = "dir" if os.path.isdir(full) else "file"
         extra = ""
@@ -535,6 +543,9 @@ def search_in_files_action(
 
     needle = pattern.lower()
     for file_path in candidates:
+        if os.path.realpath(file_path) == os.path.realpath(
+                os.path.join(workspace_root, "backend", "gmail_tokens.json")):
+            continue
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
                 for line_number, line in enumerate(handle, start=1):
@@ -625,6 +636,8 @@ def run_command_action(request: CommandExecutionRequest, timeout: int = 120) -> 
     completed = subprocess.run(
         request.command,
         cwd=request.resolved_cwd,
+        env={key: value for key, value in os.environ.items()
+             if not key.startswith("EIOMRA_GMAIL_")},
         capture_output=True,
         text=True,
         timeout=timeout,

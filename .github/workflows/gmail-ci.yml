@@ -1,0 +1,75 @@
+name: Gmail Integration Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gmail-unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependencies
+        run: python -m pip install fastapi httpx pydantic cryptography
+      - name: Check Python syntax
+        run: python -m compileall -q backend tests
+      - name: Run Gmail unit tests
+        run: python -m unittest discover -s tests -v
+
+  backend-import-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install full backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Import application and validate registered Gmail API routes
+        working-directory: backend
+        run: |
+          python - <<'PY'
+          from agent import app
+          paths = app.openapi()["paths"]
+          expected = {
+              "/gmail/status", "/gmail/unlock", "/gmail/oauth/start",
+              "/gmail/oauth/callback", "/gmail/messages", "/gmail/labels",
+              "/gmail/gmail-drafts", "/gmail/drafts/{draft_id}/approve",
+          }
+          assert expected.issubset(paths), expected - set(paths)
+          print("Gmail routes registered successfully")
+          PY
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend packages
+        working-directory: frontend
+        run: npm ci --include=optional
+      - name: Repair missing Linux Rollup optional package if needed
+        working-directory: frontend
+        run: |
+          if [ ! -d node_modules/@rollup/rollup-linux-x64-gnu ]; then
+            ROLLUP_VERSION=$(node -p "require('./node_modules/rollup/package.json').version")
+            npm install --no-save --no-package-lock "@rollup/rollup-linux-x64-gnu@$ROLLUP_VERSION"
+          fi
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
