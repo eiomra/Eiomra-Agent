@@ -636,6 +636,8 @@ def run_command_action(request: CommandExecutionRequest, timeout: int = 120) -> 
     completed = subprocess.run(
         request.command,
         cwd=request.resolved_cwd,
+        env={key: value for key, value in os.environ.items()
+             if not key.startswith("EIOMRA_GMAIL_")},
         capture_output=True,
         text=True,
         timeout=timeout,
