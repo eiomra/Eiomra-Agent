@@ -117,6 +117,7 @@ class GmailConnector:
         self.pending_drafts: dict[str, dict] = {}
         self._refresh_lock = asyncio.Lock()
         self._owner_sessions: dict[str, float] = {}
+        self._failed_logins: list[float] = []
         self.agent_allowed = False
         self.pending_path = self.path.with_name("gmail_pending.enc")
         self._load_pending()
@@ -137,7 +138,7 @@ class GmailConnector:
     def configured(self) -> bool:
         return bool(self.client_id and self.client_secret and
                     os.environ.get("EIOMRA_GMAIL_ENCRYPTION_KEY") and
-                    os.environ.get("EIOMRA_GMAIL_OWNER_PASSWORD"))
+                    len(os.environ.get("EIOMRA_GMAIL_OWNER_PASSWORD", "")) >= 16)
 
     def _cipher(self) -> Fernet:
         key = os.environ.get("EIOMRA_GMAIL_ENCRYPTION_KEY", "")
@@ -189,9 +190,15 @@ class GmailConnector:
         self._write_encrypted(self.pending_path, self.pending_drafts)
 
     def login(self, password: str) -> str:
+        now = time.time()
+        self._failed_logins = [t for t in self._failed_logins if now - t < 300]
+        if len(self._failed_logins) >= 5:
+            raise ValueError("Too many login attempts. Try again later.")
         expected = os.environ.get("EIOMRA_GMAIL_OWNER_PASSWORD", "")
         if len(expected) < 16 or not secrets.compare_digest(password, expected):
+            self._failed_logins.append(now)
             raise ValueError("Invalid Gmail owner password.")
+        self._failed_logins.clear()
         session_id = secrets.token_urlsafe(32)
         self._owner_sessions = {k: t for k, t in self._owner_sessions.items() if t > time.time()}
         self._owner_sessions[session_id] = time.time() + 43200
