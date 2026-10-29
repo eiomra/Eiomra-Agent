@@ -257,3 +257,71 @@ python -m playwright install chromium
 If OCR is unavailable, install the Tesseract binary and ensure it is on the system path or set `TESSERACT_CMD`.
 
 If the frontend reports that the backend is offline, confirm that port `8765` is listening and that `python agent.py` is still running.
+
+## Gmail integration (local OAuth preview)
+
+Eiomra can connect **one Gmail account per local installation** using Google's OAuth consent screen.
+Unlike the uploaded WadSow WordPress plugin, Eiomra does not depend on an external
+`connect-gmail.php` service and never asks the user for their Gmail password.
+
+### Google Cloud setup
+
+1. Create/select a project in [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable **Gmail API**; configure Google Auth Platform (consent screen and test users).
+3. Create an **OAuth 2.0 Web application** client and register the authorized redirect URI:
+   `http://localhost:8765/gmail/oauth/callback`
+4. Set these environment variables **before starting the backend** (do not commit credentials):
+
+   - `EIOMRA_GMAIL_CLIENT_ID` — Google OAuth client ID
+   - `EIOMRA_GMAIL_CLIENT_SECRET` — Google OAuth client secret
+   - `EIOMRA_GMAIL_REDIRECT_URI` — optional, defaults to the URI above
+
+   Linux/macOS example:
+
+   ```sh
+   export EIOMRA_GMAIL_CLIENT_ID="your-oauth-client-id"
+   export EIOMRA_GMAIL_CLIENT_SECRET="your-oauth-client-secret"
+   ./start.sh
+   ```
+
+   Windows PowerShell example:
+
+   ```powershell
+   $env:EIOMRA_GMAIL_CLIENT_ID="your-oauth-client-id"
+   $env:EIOMRA_GMAIL_CLIENT_SECRET="your-oauth-client-secret"
+   .\START.bat
+   ```
+
+5. Open **Settings → Gmail Integration → Connect with Google** and approve the
+   permissions on Google's site. Disconnect at any time from Settings.
+
+### What the agent can do
+
+- `gmail_search`: search up to 10 messages via Gmail search syntax.
+- `gmail_read`: read one message (decoded plain text, no attachment downloads).
+- `gmail_queue_send`: prepare a message addressed to one recipient. **This does not send**.
+  Review and click **Approve & Send** in Settings to deliver it.
+- Settings also includes mailbox search, message preview, draft review, discard,
+  and disconnect actions.
+
+The OAuth request uses `gmail.readonly` and `gmail.send` scopes, with short-lived
+state + PKCE. Refresh tokens are stored in the ignored `backend/gmail_tokens.json`
+file, guarded by filesystem permissions where supported. They are not encrypted
+at rest; protect local device access and backups. Disconnect deletes the token
+file and attempts Google's token revocation.
+
+### Limitations and safety
+
+- Gmail endpoints accept **only loopback requests** from this computer; the rest
+  of Eiomra may still listen on `0.0.0.0`. This integration is not designed for
+  remotely hosted or multi-tenant accounts.
+- Pending outbound messages are held in memory and expire after 24 hours; they
+  disappear after a backend restart.
+- `gmail.readonly` is a **restricted Google scope**. Public distribution may
+  require Google verification and potentially additional security assessment.
+- Gmail content can be sent to the chosen AI provider as task context. Use a
+  local model when you do not want message content sent to a cloud provider.
+- Approval is required for sending via the **Gmail API** tools. Eiomra's existing
+  browser/desktop automation is a separate path that may interact with Gmail's UI.
+- Do not treat mailbox content as instructions to the agent. Review recipient
+  addresses and message contents before approving.
