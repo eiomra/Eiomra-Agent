@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from fastapi import HTTPException
+from cryptography.fernet import Fernet
 from gmail_integration import (
     GmailConnector, decode_body, guard_local, message_summary, valid_address,
 )
@@ -17,6 +18,14 @@ from gmail_integration import (
 
 class GmailConnectorTests(unittest.TestCase):
     def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {
+            "EIOMRA_GMAIL_ENCRYPTION_KEY": Fernet.generate_key().decode("ascii"),
+            "EIOMRA_GMAIL_OWNER_PASSWORD": "test-strong-passphrase-only",
+            "EIOMRA_GMAIL_CLIENT_ID": "test-id",
+            "EIOMRA_GMAIL_CLIENT_SECRET": "test-secret",
+        })
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.gmail = GmailConnector(Path(self.dir.name) / "gmail_tokens.json")
@@ -51,6 +60,43 @@ class GmailConnectorTests(unittest.TestCase):
         self.assertTrue(status["connected"])
         self.assertNotIn("refresh_token", str(status))
         self.assertTrue(status["send_requires_approval"])
+        self.assertNotIn(b"test-refresh-placeholder", self.gmail.path.read_bytes())
+
+    def test_owner_login_and_session(self):
+        from types import SimpleNamespace
+        session = self.gmail.login("test-strong-passphrase-only")
+        request = SimpleNamespace(cookies={"eiomra_gmail_owner": session})
+        self.assertTrue(self.gmail.authenticated(request))
+        self.assertFalse(self.gmail.authenticated(SimpleNamespace(cookies={})))
+        with self.assertRaises(ValueError):
+            self.gmail.login("invalid-password")
+
+    def test_pending_queue_is_encrypted_and_survives_restart(self):
+        self.connect_fake_account()
+        draft = self.gmail.draft("to@example.com", "Hello", "Important private body")
+        self.assertNotIn(b"Important private body", self.gmail.pending_path.read_bytes())
+        restored = GmailConnector(self.gmail.path)
+        self.assertEqual(restored.drafts()[0]["id"], draft["id"])
+
+    def test_label_operations_use_gmail_api(self):
+        self.connect_fake_account()
+        async def verify():
+            with patch.object(self.gmail, "request_api", AsyncMock(return_value={"labels": [{"id":"INBOX","name":"Inbox"}]})) as mock:
+                labels = await self.gmail.list_labels()
+                self.assertEqual(labels["labels"][0]["id"], "INBOX")
+                mock.assert_awaited_once()
+            with patch.object(self.gmail, "request_api", AsyncMock(return_value={"id":"0123456789","labelIds":["STARRED"]})) as mock:
+                result = await self.gmail.modify_labels("0123456789", ["STARRED"], ["UNREAD"])
+                self.assertEqual(result["label_ids"], ["STARRED"])
+                self.assertEqual(mock.await_args.kwargs["json_data"]["removeLabelIds"], ["UNREAD"])
+        asyncio.run(verify())
+
+    def test_create_real_gmail_draft(self):
+        self.connect_fake_account()
+        with patch.object(self.gmail, "request_api", AsyncMock(return_value={"id":"draft123"})) as mock:
+            result = asyncio.run(self.gmail.create_gmail_draft("to@example.com", "Subject", "Body"))
+            self.assertEqual(result["draft_id"], "draft123")
+            self.assertEqual(mock.await_args.args[:2], ("POST", "/drafts"))
 
     def test_send_is_queued_until_explicit_approval(self):
         self.connect_fake_account()
