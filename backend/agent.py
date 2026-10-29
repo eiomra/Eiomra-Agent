@@ -39,6 +39,10 @@ from desktop_automation_portable import (
 )
 from page_reader  import extract_page_content, get_capabilities, rank_candidates, format_candidates
 from gmail_integration import GmailConnector, make_router
+from gmail_tool_calls import (
+    openai_tools, gemini_tools, anthropic_tools,
+    from_openai_message, from_ollama_message, from_gemini_response, from_anthropic_response,
+)
 from action_protocol import action_to_history_entry, normalize_action_payload
 from agent_sessions import AgentOrchestrator, AgentSessionStore
 from bot_registry import BotRegistry
@@ -319,96 +323,105 @@ def _make_image_part_google(b64: str) -> dict:
 
 async def call_provider(provider, model, system_prompt, user_prompt, cfg,
                         image_b64: str | None = None) -> str:
-    """Call a model provider.  If *image_b64* is set, include the screenshot
-    as a vision input so the model can see the current screen state."""
-
-    if provider == "ollama_local":
-        url = cfg["ollama_local_url"].rstrip("/") + "/api/chat"
-        user_msg: dict = {"role": "user", "content": user_prompt}
-        if image_b64:
-            user_msg["images"] = [image_b64]
-        async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url, json={
-                "model": model,
-                "messages": [{"role": "system", "content": system_prompt}, user_msg],
-                "stream": False,
-                "options": {"temperature": 0.2, "num_ctx": 8192}
-            })
-            r.raise_for_status()
-            return r.json()["message"]["content"].strip()
-
-    elif provider == "ollama_cloud":
-        if not cfg.get("ollama_cloud_key"): raise ValueError("Ollama Cloud key not set")
-        url = cfg["ollama_cloud_url"].rstrip("/") + "/chat"
+    """Invoke an LLM, translating native Gmail tool calls into agent actions."""
+    tracker = globals().get("current_tracker")
+    goal = str(getattr(tracker, "goal", "") or "")
+    gmail_tools = (
+        system_prompt == EXECUTOR_SYSTEM
+        and bool(re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal))
+        and gmail_service.status()["connected"]
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    if provider in {"ollama_local", "ollama_cloud"}:
         user_msg = {"role": "user", "content": user_prompt}
         if image_b64:
             user_msg["images"] = [image_b64]
+        messages.append(user_msg)
+        is_local = provider == "ollama_local"
+        if is_local:
+            url = cfg["ollama_local_url"].rstrip("/") + "/api/chat"
+            headers = {}
+        else:
+            if not cfg.get("ollama_cloud_key"):
+                raise ValueError("Ollama Cloud key not set")
+            url = cfg["ollama_cloud_url"].rstrip("/") + "/chat"
+            headers = {"Authorization": f"Bearer {cfg['ollama_cloud_key']}"}
+        payload = {"model": model, "messages": messages, "stream": False}
+        if is_local:
+            payload["options"] = {"temperature": 0.2, "num_ctx": 8192}
+        if gmail_tools:
+            payload["tools"] = openai_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url,
-                headers={"Authorization": f"Bearer {cfg['ollama_cloud_key']}"},
-                json={"model": model,
-                      "messages": [{"role": "system", "content": system_prompt}, user_msg],
-                      "stream": False})
+            r = await c.post(url, headers=headers, json=payload)
             r.raise_for_status()
-            return r.json()["message"]["content"].strip()
+        message = r.json()["message"]
+        return (from_ollama_message(message) if gmail_tools else None) or (message.get("content") or "").strip()
 
-    elif provider == "google":
-        if not cfg.get("google_api_key"): raise ValueError("Google API key not set")
+    if provider == "google":
+        if not cfg.get("google_api_key"):
+            raise ValueError("Google API key not set")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        parts: list = [{"text": f"{system_prompt}\n\n{user_prompt}"}]
+        parts = [{"text": f"{system_prompt}\n\n{user_prompt}"}]
         if image_b64:
             parts.insert(0, _make_image_part_google(image_b64))
+        payload = {"contents": [{"role": "user", "parts": parts}],
+                   "generationConfig": {"temperature": 0.2}}
+        if gmail_tools:
+            payload["tools"] = gemini_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
-            r = await c.post(url,
-                headers={"x-goog-api-key": cfg["google_api_key"],
-                         "Content-Type": "application/json"},
-                json={"contents": [{"role": "user", "parts": parts}],
-                      "generationConfig": {"temperature": 0.2}})
+            r = await c.post(url, headers={"x-goog-api-key": cfg["google_api_key"],
+                                          "Content-Type": "application/json"}, json=payload)
             r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = r.json()
+        native = from_gemini_response(data) if gmail_tools else None
+        if native:
+            return native
+        response_parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts") or []
+        return next((part["text"].strip() for part in response_parts if part.get("text")), "")
 
-    elif provider == "openai":
-        if not cfg.get("openai_api_key"): raise ValueError("OpenAI key not set")
-        if image_b64:
-            user_content: list | str = [
-                {"type": "text", "text": user_prompt},
-                _make_image_part_openai(image_b64),
-            ]
-        else:
-            user_content = user_prompt
+    if provider == "openai":
+        if not cfg.get("openai_api_key"):
+            raise ValueError("OpenAI key not set")
+        content = ([{"type": "text", "text": user_prompt},
+                    _make_image_part_openai(image_b64)] if image_b64 else user_prompt)
+        messages.append({"role": "user", "content": content})
+        payload = {"model": model, "temperature": 0.2, "messages": messages}
+        if gmail_tools:
+            payload.update({"tools": openai_tools(), "tool_choice": "auto"})
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
             r = await c.post("https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {cfg['openai_api_key']}",
-                         "Content-Type": "application/json"},
-                json={"model": model, "temperature": 0.2,
-                      "messages": [{"role": "system", "content": system_prompt},
-                                    {"role": "user",   "content": user_content}]})
+                             headers={"Authorization": f"Bearer {cfg['openai_api_key']}",
+                                      "Content-Type": "application/json"},
+                             json=payload)
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+        message = r.json()["choices"][0]["message"]
+        return (from_openai_message(message) if gmail_tools else None) or (message.get("content") or "").strip()
 
-    elif provider == "anthropic":
-        if not cfg.get("anthropic_api_key"): raise ValueError("Anthropic key not set")
-        if image_b64:
-            user_content = [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                {"type": "text", "text": user_prompt},
-            ]
-        else:
-            user_content = user_prompt
+    if provider == "anthropic":
+        if not cfg.get("anthropic_api_key"):
+            raise ValueError("Anthropic key not set")
+        content = ([{"type": "image", "source": {"type": "base64",
+                    "media_type": "image/jpeg", "data": image_b64}},
+                    {"type": "text", "text": user_prompt}] if image_b64 else user_prompt)
+        payload = {"model": model, "max_tokens": 4096, "temperature": 0.2,
+                   "system": system_prompt, "messages": [{"role": "user", "content": content}]}
+        if gmail_tools:
+            payload["tools"] = anthropic_tools()
         async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as c:
             r = await c.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": cfg["anthropic_api_key"],
-                         "anthropic-version": "2023-06-01",
-                         "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": 4096, "temperature": 0.2,
-                      "system": system_prompt,
-                      "messages": [{"role": "user", "content": user_content}]})
+                             headers={"x-api-key": cfg["anthropic_api_key"],
+                                      "anthropic-version": "2023-06-01",
+                                      "Content-Type": "application/json"},
+                             json=payload)
             r.raise_for_status()
-            return r.json()["content"][0]["text"].strip()
+        data = r.json()
+        native = from_anthropic_response(data) if gmail_tools else None
+        if native:
+            return native
+        return next((item["text"].strip() for item in data.get("content", [])
+                     if item.get("type") == "text"), "")
 
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
+    raise ValueError(f"Unknown provider: {provider}")
 
 _provider_request_locks: dict[str, asyncio.Lock] = {}
 _provider_last_request_at: dict[str, float] = {}
