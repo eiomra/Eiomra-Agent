@@ -258,70 +258,106 @@ If OCR is unavailable, install the Tesseract binary and ensure it is on the syst
 
 If the frontend reports that the backend is offline, confirm that port `8765` is listening and that `python agent.py` is still running.
 
-## Gmail integration (local OAuth preview)
+## Gmail integration: OAuth, native agent tools, and explicit send approval
 
-Eiomra can connect **one Gmail account per local installation** using Google's OAuth consent screen.
-Unlike the uploaded WadSow WordPress plugin, Eiomra does not depend on an external
-`connect-gmail.php` service and never asks the user for their Gmail password.
+Eiomra can connect a Google mailbox using OAuth 2.0. The integration uses the
+Gmail API directly and does **not** use a hosted third-party account-linking
+service, ask for a Gmail password, or expose Google tokens to the frontend.
 
-### Google Cloud setup
+### 1. Google Cloud configuration
 
-1. Create/select a project in [Google Cloud Console](https://console.cloud.google.com/).
-2. Enable **Gmail API**; configure Google Auth Platform (consent screen and test users).
-3. Create an **OAuth 2.0 Web application** client and register the authorized redirect URI:
-   `http://localhost:8765/gmail/oauth/callback`
-4. Set these environment variables **before starting the backend** (do not commit credentials):
+1. Create/select a Google Cloud project, enable the Gmail API, and configure
+   Google Auth Platform (OAuth consent screen, authorized application domain,
+   privacy policy and test users while in Testing mode).
+2. Create an **OAuth 2.0 Web application** client.
+3. Register the exact authorized redirect URI:
+   http://localhost:8765/gmail/oauth/callback
+4. For publicly distributed applications, follow Google's OAuth verification
+   and restricted-scope security-assessment requirements.
 
-   - `EIOMRA_GMAIL_CLIENT_ID` — Google OAuth client ID
-   - `EIOMRA_GMAIL_CLIENT_SECRET` — Google OAuth client secret
-   - `EIOMRA_GMAIL_REDIRECT_URI` — optional, defaults to the URI above
+The app requests **gmail.modify**, a restricted scope needed for reading,
+drafting, sending, and changing mailbox labels. Eiomra does not request
+permanent deletion. Disconnect revokes the refresh token when possible.
 
-   Linux/macOS example:
+### 2. Local credentials and authentication
 
-   ```sh
-   export EIOMRA_GMAIL_CLIENT_ID="your-oauth-client-id"
-   export EIOMRA_GMAIL_CLIENT_SECRET="your-oauth-client-secret"
-   ./start.sh
-   ```
+Set the following environment variables before starting Eiomra:
 
-   Windows PowerShell example:
+| Variable | Description |
+| --- | --- |
+| EIOMRA_GMAIL_CLIENT_ID | OAuth Web client ID from Google Cloud |
+| EIOMRA_GMAIL_CLIENT_SECRET | OAuth Web client secret |
+| EIOMRA_GMAIL_ENCRYPTION_KEY | Fernet key to encrypt tokens and pending mail |
+| EIOMRA_GMAIL_OWNER_PASSWORD | Strong password (minimum 16 characters) protecting the local Gmail panel |
+| EIOMRA_GMAIL_REDIRECT_URI | Optional override of the exact OAuth callback, default http://localhost:8765/gmail/oauth/callback |
+| EIOMRA_GMAIL_STATE_DIR | Optional encrypted state directory, default ~/.eiomra/secrets |
 
-   ```powershell
-   $env:EIOMRA_GMAIL_CLIENT_ID="your-oauth-client-id"
-   $env:EIOMRA_GMAIL_CLIENT_SECRET="your-oauth-client-secret"
-   .\START.bat
-   ```
+Generate a new encryption key:
 
-5. Open **Settings → Gmail Integration → Connect with Google** and approve the
-   permissions on Google's site. Disconnect at any time from Settings.
+\`\`\`bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+\`\`\`
 
-### What the agent can do
+Store the key and owner password in a private secret manager or environment
+configuration. Do not commit them to Git, log them, or expose them to the agent.
+Keep the encryption key across restarts: replacing it makes existing tokens and
+pending messages unreadable.
 
-- `gmail_search`: search up to 10 messages via Gmail search syntax.
-- `gmail_read`: read one message (decoded plain text, no attachment downloads).
-- `gmail_queue_send`: prepare a message addressed to one recipient. **This does not send**.
-  Review and click **Approve & Send** in Settings to deliver it.
-- Settings also includes mailbox search, message preview, draft review, discard,
-  and disconnect actions.
+On Linux/macOS, set variables using your shell or a secure service environment.
+On Windows, use PowerShell's \`$env:VARIABLE="value"\` syntax, then launch
+\`START.bat\` from the same terminal.
 
-The OAuth request uses `gmail.readonly` and `gmail.send` scopes, with short-lived
-state + PKCE. Refresh tokens are stored in the ignored `backend/gmail_tokens.json`
-file, guarded by filesystem permissions where supported. They are not encrypted
-at rest; protect local device access and backups. Disconnect deletes the token
-file and attempts Google's token revocation.
+### 3. Connect and use
 
-### Limitations and safety
+Open http://localhost:3000 → Settings → Gmail Integration. Unlock with the
+owner password, click **Connect with Google**, and grant Gmail access. The
+encrypted token file is stored **outside the code workspace** by default.
+Pending messages are also encrypted and persist across normal restarts.
 
-- Gmail endpoints accept **only loopback requests** from this computer; the rest
-  of Eiomra may still listen on `0.0.0.0`. This integration is not designed for
-  remotely hosted or multi-tenant accounts.
-- Pending outbound messages are held in memory and expire after 24 hours; they
-  disappear after a backend restart.
-- `gmail.readonly` is a **restricted Google scope**. Public distribution may
-  require Google verification and potentially additional security assessment.
-- Gmail content can be sent to the chosen AI provider as task context. Use a
-  local model when you do not want message content sent to a cloud provider.
-- Approval is required for sending via the **Gmail API** tools. Eiomra's existing
-  browser/desktop automation is a separate path that may interact with Gmail's UI.
-- Do not treat mailbox content as instructions to the agent. Review recipient
-  addresses and message contents before approving.
+The agent's native function tools (OpenAI, Ollama, Gemini, Anthropic providers)
+and structured-action fallback use these operations:
+
+| Tool | Behavior |
+| --- | --- |
+| gmail_search | Search up to 10 messages using Gmail query syntax |
+| gmail_read | Read a selected message with decoded plain text |
+| gmail_list_labels | List available Gmail labels |
+| gmail_modify_labels | Mark read/unread, archive, star or apply/remove labels |
+| gmail_create_draft | Create a real draft in Gmail |
+| gmail_queue_reply | Prepare a reply linked to an existing thread |
+| gmail_send | Prepare an email for human approval (not immediate delivery) |
+
+**Sending is a two-step process.** The model may prepare an email, but the
+owner must review it in Settings and explicitly click **Approve & Send**.
+Approval consumes the queued item before an API send attempt to reduce
+duplicate sends. If the network fails ambiguously, inspect Gmail's Sent
+folder before retrying. Queued replies preserve Gmail thread references.
+Connection and drafts can be reviewed or removed in Settings.
+
+The model is offered Gmail tools only when a connected account exists and the
+original user goal mentions Gmail or email. Mutating actions additionally
+require an explicit writing/sending or mailbox-management request.
+
+### Security and deployment model
+
+This implementation is designed for an **individual local installation**.
+It protects Gmail endpoints with a loopback-only network gate, allowed browser
+origins, short-lived owner sessions, OAuth state and PKCE, and encrypted local
+credentials. Eiomra binds to 127.0.0.1 by default. Do not expose the backend to
+the internet or a multi-user network without a separate, comprehensive
+application authentication and tenant-isolation layer.
+
+Only the Gmail API path uses Gmail send approvals. Existing browser/desktop
+automation can still interact with Gmail's website independently. For sensitive
+mail, keep desktop autonomy/command execution disabled and use a local model
+unless you intentionally permit mail content to reach a cloud model provider.
+Inbox messages and web pages are untrusted input; the system instructs the
+agent not to follow instructions contained in mail.
+
+### Automated validation
+
+CI checks Python 3.10/3.12 Gmail unit tests and the Vite frontend build.
+Offline tests cover OAuth state/PKCE, at-rest encryption, native model tool
+schemas, drafts, approval idempotency, label operations, and local access rules.
+No tests use real Google tokens or send mail.
+
