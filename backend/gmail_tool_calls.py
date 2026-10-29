@@ -118,7 +118,10 @@ def _verified_call(name: str, arguments: Any) -> str | None:
     if name == "gmail_send":
         name = "gmail_queue_send"  # Intentional approval gate.
     if name == "gmail_search":
-        arguments["limit"] = max(1, min(int(arguments.get("limit", 5)), 10))
+        try:
+            arguments["limit"] = max(1, min(int(arguments.get("limit", 5)), 10))
+        except (TypeError, ValueError):
+            return None
     return json.dumps({"action": name, **arguments}, ensure_ascii=False)
 
 
