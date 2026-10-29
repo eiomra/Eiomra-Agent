@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx, uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
 
@@ -344,6 +344,7 @@ async def call_provider(provider, model, system_prompt, user_prompt, cfg,
         system_prompt == EXECUTOR_SYSTEM
         and bool(re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal))
         and gmail_service.status()["connected"]
+        and gmail_service.agent_allowed
     )
     messages = [{"role": "system", "content": system_prompt}]
     if provider in {"ollama_local", "ollama_cloud"}:
@@ -1315,7 +1316,11 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
         cfg = load_config()
         # Tool calls generated from untrusted pages must not obtain Gmail access
         # unless the user's original goal explicitly requests email work.
+        if act.startswith("gmail_") and from_manual:
+            return "Gmail tools must use the authenticated Gmail Settings API, not generic manual actions."
         if act.startswith("gmail_") and not from_manual:
+            if not gmail_service.agent_allowed:
+                return "Gmail actions are locked. Unlock Gmail in Settings and start a new task."
             goal = str(getattr(globals().get("current_tracker"), "goal", "") or "")
             if not re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal):
                 return "Gmail tool blocked: the original user goal did not authorize email access."
@@ -4281,7 +4286,7 @@ async def resume_computer_agent():
     return {"status": "ok", "control_owner": control_owner, "agent_running": agent_running}
 
 @app.post("/start")
-async def start_agent(body: dict):
+async def start_agent(body: dict, request: Request):
     global agent_running, agent_task
     if agent_task and not agent_task.done():
         raise HTTPException(status_code=409, detail="A bot task is already running. Stop it or wait for it to finish.")
@@ -4303,6 +4308,13 @@ async def start_agent(body: dict):
     goal = str(body.get("goal", "")).strip()
     if not goal:
         raise HTTPException(status_code=400, detail="A goal is required to start the agent.")
+    gmail_goal = bool(re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal))
+    if gmail_goal and gmail_service.status()["connected"] and not gmail_service.authenticated(request):
+        raise HTTPException(status_code=401,
+                            detail="Unlock Gmail in Settings before starting an email task.")
+    # The owner grant applies only to the current task, never to generic manual
+    # actions, resumed tasks on startup or unrelated sessions.
+    gmail_service.agent_allowed = gmail_goal and gmail_service.authenticated(request)
     bot_id = str(body.get("bot_id") or "primary")
     if not bot_registry.get(bot_id):
         raise HTTPException(status_code=404, detail="Selected bot was not found.")
@@ -4321,6 +4333,7 @@ async def start_agent(body: dict):
 @app.post("/stop")
 async def stop_agent():
     global agent_running, control_owner
+    gmail_service.agent_allowed = False
     agent_running = False
     control_owner = "human"
     agent_control_event.set()
@@ -4328,6 +4341,8 @@ async def stop_agent():
 
 @app.post("/manual")
 async def manual_action(body: dict):
+    if str(body.get("action", "")).startswith("gmail_"):
+        raise HTTPException(status_code=403, detail="Use authenticated Gmail Settings endpoints.")
     if agent_running and control_owner != "human":
         raise HTTPException(status_code=409, detail="Take control before interacting with the running browser.")
     async with browser_input_lock:
