@@ -28,6 +28,100 @@ function Typewriter({text,speed=12}){
   return <span>{d}</span>;
 }
 
+/* Gmail uses Google's OAuth consent flow, not passwords entered into Eiomra. */
+function GmailSettings(){
+  const [status,setStatus]=useState(null);
+  const [drafts,setDrafts]=useState([]);
+  const [query,setQuery]=useState("");
+  const [messages,setMessages]=useState([]);
+  const [selected,setSelected]=useState(null);
+  const [error,setError]=useState("");
+  const [busy,setBusy]=useState(false);
+  const refresh=useCallback(async()=>{
+    try {
+      const [a,b]=await Promise.all([fetch( API + "/gmail/status"),fetch(API + "/gmail/drafts")]);
+      if(!a.ok || !b.ok) throw new Error("Gmail settings are unavailable");
+      setStatus(await a.json()); setDrafts((await b.json()).drafts||[]);
+    } catch(e){setError(e.message);}
+  },[]);
+  useEffect(()=>{refresh();},[refresh]);
+  const command=async(path,method="POST")=>{
+    setBusy(true); setError("");
+    try{
+      const res=await fetch(API + path,{method});
+      if(!res.ok){const data=await res.json();throw new Error(data.detail||"Gmail request failed");}
+      await refresh();
+    }catch(e){setError(e.message);}finally{setBusy(false);}
+  };
+  const search=async()=>{
+    setBusy(true);setError("");setSelected(null);
+    try{
+      const r=await fetch(API + "/gmail/messages?q=" + encodeURIComponent(query) + "&limit=5");
+      const d=await r.json();if(!r.ok)throw new Error(d.detail||"Search failed");
+      setMessages(d.messages||[]);
+    }catch(e){setError(e.message);}finally{setBusy(false);}
+  };
+  const read=async(id)=>{
+    setBusy(true);setError("");
+    try{
+      const r=await fetch(API + "/gmail/messages/" + encodeURIComponent(id));
+      const d=await r.json();if(!r.ok)throw new Error(d.detail||"Could not read message");
+      setSelected(d);
+    }catch(e){setError(e.message);}finally{setBusy(false);}
+  };
+  const btn={padding:"6px 10px",borderRadius:6,border:"1px solid #40475e",background:"#1c2437",color:"#dbeafe",fontSize:11,cursor:"pointer",fontFamily:"inherit"};
+  return <section style={{border:"1px solid #2d3748",borderRadius:8,padding:12,margin:"8px 0 18px",color:"#cbd5e1"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:8}}>
+      <strong style={{fontSize:12}}>✉ Gmail account</strong>
+      <span style={{fontSize:10,color:status?.connected?"#4ade80":"#94a3b8"}}>
+        {status?.connected?status.email:status?.configured?"Not connected":"OAuth not configured"}
+      </span>
+    </div>
+    <p style={{fontSize:10,lineHeight:1.6,color:"#94a3b8"}}>
+      Grant read and send access through Google. The agent can search and read connected mail.
+      Outgoing messages always require your approval here before sending.
+    </p>
+    {error&&<div role="alert" style={{fontSize:10,color:"#fda4af",marginBottom:8}}>{error}</div>}
+    {!status?.configured
+      ? <p style={{fontSize:10,color:"#facc15"}}>Set EIOMRA_GMAIL_CLIENT_ID and EIOMRA_GMAIL_CLIENT_SECRET in the backend environment, then restart it.</p>
+      : <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+          {!status.connected
+            ? <button type="button" style={btn} onClick={()=>window.location.assign(API + "/gmail/oauth/start")}>Connect with Google</button>
+            : <button type="button" style={btn} disabled={busy} onClick={()=>{
+                if(window.confirm("Disconnect Gmail and clear pending messages?"))command("/gmail/disconnect");
+              }}>Disconnect Gmail</button>}
+          <button type="button" style={btn} disabled={busy} onClick={refresh}>Refresh</button>
+        </div>}
+    {status?.connected&&<>
+      <div style={{display:"flex",gap:6,marginBottom:9}}>
+        <input aria-label="Search Gmail" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Gmail search (e.g. from:someone@example.com)"
+          style={{minWidth:0,flex:1,border:"1px solid #334155",borderRadius:5,background:"#0b1220",color:"#e2e8f0",padding:7,fontSize:10}}/>
+        <button type="button" style={btn} disabled={busy} onClick={search}>Search</button>
+      </div>
+      {messages.map(m=><div key={m.id} style={{fontSize:10,marginBottom:6}}>
+        <button type="button" disabled={busy} onClick={()=>read(m.id)} style={{...btn,textAlign:"left",width:"100%"}}>
+          <b>{m.subject||"(No subject)"}</b> — {m.from}<div style={{color:"#94a3b8"}}>{m.snippet}</div>
+        </button>
+      </div>)}
+      {selected&&<div style={{padding:9,marginBottom:10,border:"1px solid #334155",borderRadius:5,fontSize:10,whiteSpace:"pre-wrap",maxHeight:160,overflow:"auto"}}>
+        <b>{selected.subject}</b><div>{selected.from}</div><hr style={{borderColor:"#334155"}}/>{selected.body||selected.snippet}
+      </div>}
+      <b style={{fontSize:11}}>Awaiting approval ({drafts.length})</b>
+      {!drafts.length&&<p style={{fontSize:10,color:"#94a3b8"}}>No messages are awaiting approval. Ask the agent to compose an email to create one.</p>}
+      {drafts.map(d=><div key={d.id} style={{border:"1px solid #334155",padding:9,marginTop:7,borderRadius:6,fontSize:10}}>
+        <div><b>To:</b> {d.to}</div><div><b>Subject:</b> {d.subject}</div>
+        <div style={{whiteSpace:"pre-wrap",maxHeight:140,overflow:"auto",margin:"7px 0"}}>{d.body}</div>
+        <div style={{display:"flex",gap:6}}>
+          <button type="button" style={btn} disabled={busy} onClick={()=>{
+            if(window.confirm("Send this email to " + d.to + "?"))command("/gmail/drafts/" + encodeURIComponent(d.id) + "/approve");
+          }}>Approve & Send</button>
+          <button type="button" style={btn} disabled={busy} onClick={()=>command("/gmail/drafts/" + encodeURIComponent(d.id),"DELETE")}>Discard</button>
+        </div>
+      </div>)}
+    </>}
+  </section>;
+}
+
 /* ── Settings Panel ─────────────────────────────────────────────────────── */
 function SettingsPanel({onClose}){
   const [cfg,setCfg]=useState(null);
@@ -98,6 +192,9 @@ function SettingsPanel({onClose}){
         {row("Ollama Cloud URL",inp(cfg.ollama_cloud_url||"",v=>setCfg(c=>({...c,ollama_cloud_url:v}))))}
         {row("Google Gemini Key",inp(keys.google_api_key,v=>setKeys(k=>({...k,google_api_key:v})),cfg.google_api_key||"Enter key…","password"))}
         {row("OpenAI Key",inp(keys.openai_api_key,v=>setKeys(k=>({...k,openai_api_key:v})),cfg.openai_api_key||"Enter key…","password"))}
+        <div style={{height:1,background:"#1a1f2e",margin:"14px 0"}}/>
+        {sec("✉ Gmail Integration","#22c55e")}
+        <GmailSettings/>
 
         <div style={{height:1,background:"#1a1f2e",margin:"14px 0"}}/>
         {sec("🔄 Fallback","#f59e0b")}
