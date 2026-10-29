@@ -2334,6 +2334,17 @@ class StuckDetector:
     def reset(self): self.recent = []
 
 
+def private_history_for_storage(history: list[dict]) -> list[dict]:
+    """Keep Gmail message bodies out of routine session logs and checkpoints."""
+    safe = []
+    for entry in history:
+        item = dict(entry)
+        if str(item.get("action", "")).startswith("gmail_"):
+            item["result"] = "[Gmail content excluded from saved history]"
+        safe.append(item)
+    return safe
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # SAVE RESULT
 # ══════════════════════════════════════════════════════════════════════════
@@ -2800,7 +2811,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             model=current_model,
             bot_id=current_bot_id,
             planned_tasks=tracker.to_dict()["tasks"],
-            runtime_history=history[-80:],
+            runtime_history=private_history_for_storage(history[-80:]),
         )
         bot_registry.update(current_bot_id, status="running", current_task_id=task_id,
                             current_goal=goal, last_url=context.get("url", ""),
@@ -3274,7 +3285,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 else:  session_log.error("complete_task", msg)
             history.append({"action":f"complete_task: {completed_task_id}","result":msg})
             orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
-                                      runtime_history=history[-80:])
+                                      runtime_history=private_history_for_storage(history[-80:]))
             orchestrator.append_event(task_id, "task_completed", {
                 "task_id": completed_task_id,
                 "finding": finding,
@@ -3308,7 +3319,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 else:  session_log.error("skip_task", msg)
             history.append({"action":f"skip_task: {skipped_task_id}","result":msg})
             orchestrator.set_metadata(task_id, planned_tasks=tracker.to_dict()["tasks"],
-                                      runtime_history=history[-80:])
+                                      runtime_history=private_history_for_storage(history[-80:]))
             orchestrator.append_event(task_id, "task_skipped", {
                 "task_id": skipped_task_id,
                 "reason": reason,
@@ -3509,7 +3520,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
 
         filename = ""
         try:
-            fp = save_result(tracker, report, history, current_provider, current_model)
+            fp = save_result(tracker, report, private_history_for_storage(history), current_provider, current_model)
             filename = os.path.basename(fp)
         except Exception: pass
 
@@ -3526,7 +3537,7 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             result_filename=filename,
             final_tasks=tracker.to_dict()["tasks"],
             planned_tasks=tracker.to_dict()["tasks"],
-            runtime_history=history[-80:],
+            runtime_history=private_history_for_storage(history[-80:]),
             synced_report_artifacts=synced_report_artifacts,
         )
         orchestrator.append_event(task_id, "session_completed", {
