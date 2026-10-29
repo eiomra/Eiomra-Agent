@@ -37,18 +37,23 @@ function GmailSettings(){
   const [selected,setSelected]=useState(null);
   const [error,setError]=useState("");
   const [busy,setBusy]=useState(false);
+  const [password,setPassword]=useState("");
   const refresh=useCallback(async()=>{
     try {
-      const [a,b]=await Promise.all([fetch( API + "/gmail/status"),fetch(API + "/gmail/drafts")]);
-      if(!a.ok || !b.ok) throw new Error("Gmail settings are unavailable");
-      setStatus(await a.json()); setDrafts((await b.json()).drafts||[]);
+      const a=await fetch(API + "/gmail/status",{credentials:"include"});
+      if(!a.ok) throw new Error("Gmail settings are unavailable");
+      const info=await a.json(); setStatus(info);
+      if(!info.locked){
+        const b=await fetch(API + "/gmail/drafts",{credentials:"include"});
+        if(b.ok)setDrafts((await b.json()).drafts||[]);
+      } else { setDrafts([]); }
     } catch(e){setError(e.message);}
   },[]);
   useEffect(()=>{refresh();},[refresh]);
   const command=async(path,method="POST")=>{
     setBusy(true); setError("");
     try{
-      const res=await fetch(API + path,{method});
+      const res=await fetch(API + path,{method,credentials:"include"});
       if(!res.ok){const data=await res.json();throw new Error(data.detail||"Gmail request failed");}
       await refresh();
     }catch(e){setError(e.message);}finally{setBusy(false);}
@@ -56,7 +61,7 @@ function GmailSettings(){
   const search=async()=>{
     setBusy(true);setError("");setSelected(null);
     try{
-      const r=await fetch(API + "/gmail/messages?q=" + encodeURIComponent(query) + "&limit=5");
+      const r=await fetch(API + "/gmail/messages?q=" + encodeURIComponent(query) + "&limit=5",{credentials:"include"});
       const d=await r.json();if(!r.ok)throw new Error(d.detail||"Search failed");
       setMessages(d.messages||[]);
     }catch(e){setError(e.message);}finally{setBusy(false);}
@@ -64,9 +69,20 @@ function GmailSettings(){
   const read=async(id)=>{
     setBusy(true);setError("");
     try{
-      const r=await fetch(API + "/gmail/messages/" + encodeURIComponent(id));
+      const r=await fetch(API + "/gmail/messages/" + encodeURIComponent(id),{credentials:"include"});
       const d=await r.json();if(!r.ok)throw new Error(d.detail||"Could not read message");
       setSelected(d);
+    }catch(e){setError(e.message);}finally{setBusy(false);}
+  };
+  const unlock=async()=>{
+    setBusy(true);setError("");
+    try{
+      const r=await fetch(API + "/gmail/unlock",{
+        method:"POST",credentials:"include",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({password}),
+      });
+      if(!r.ok)throw new Error("Invalid Gmail owner password");
+      setPassword(""); await refresh();
     }catch(e){setError(e.message);}finally{setBusy(false);}
   };
   const btn={padding:"6px 10px",borderRadius:6,border:"1px solid #40475e",background:"#1c2437",color:"#dbeafe",fontSize:11,cursor:"pointer",fontFamily:"inherit"};
@@ -74,7 +90,7 @@ function GmailSettings(){
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,marginBottom:8}}>
       <strong style={{fontSize:12}}>✉ Gmail account</strong>
       <span style={{fontSize:10,color:status?.connected?"#4ade80":"#94a3b8"}}>
-        {status?.connected?status.email:status?.configured?"Not connected":"OAuth not configured"}
+        {status?.locked?"Locked":status?.connected?status.email:status?.configured?"Not connected":"OAuth not configured"}
       </span>
     </div>
     <p style={{fontSize:10,lineHeight:1.6,color:"#94a3b8"}}>
@@ -83,8 +99,15 @@ function GmailSettings(){
     </p>
     {error&&<div role="alert" style={{fontSize:10,color:"#fda4af",marginBottom:8}}>{error}</div>}
     {!status?.configured
-      ? <p style={{fontSize:10,color:"#facc15"}}>Set EIOMRA_GMAIL_CLIENT_ID and EIOMRA_GMAIL_CLIENT_SECRET in the backend environment, then restart it.</p>
-      : <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+      ? <p style={{fontSize:10,color:"#facc15"}}>Configure Google OAuth, EIOMRA_GMAIL_ENCRYPTION_KEY, and EIOMRA_GMAIL_OWNER_PASSWORD in the backend environment, then restart it.</p>
+      : status?.locked
+        ? <div style={{display:"flex",gap:7,marginBottom:10}}>
+            <input aria-label="Gmail owner password" type="password" value={password} onChange={e=>setPassword(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter")unlock();}} placeholder="Gmail owner password"
+              style={{flex:1,minWidth:0,background:"#0b1220",color:"#e2e8f0",border:"1px solid #334155",borderRadius:5,padding:7}}/>
+            <button type="button" style={btn} disabled={busy||!password} onClick={unlock}>Unlock</button>
+          </div>
+        : <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
           {!status.connected
             ? <button type="button" style={btn} onClick={()=>window.location.assign(API + "/gmail/oauth/start")}>Connect with Google</button>
             : <button type="button" style={btn} disabled={busy} onClick={()=>{
@@ -92,7 +115,7 @@ function GmailSettings(){
               }}>Disconnect Gmail</button>}
           <button type="button" style={btn} disabled={busy} onClick={refresh}>Refresh</button>
         </div>}
-    {status?.connected&&<>
+    {status?.connected&&!status?.locked&&<>
       <div style={{display:"flex",gap:6,marginBottom:9}}>
         <input aria-label="Search Gmail" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Gmail search (e.g. from:someone@example.com)"
           style={{minWidth:0,flex:1,border:"1px solid #334155",borderRadius:5,background:"#0b1220",color:"#e2e8f0",padding:7,fontSize:10}}/>
