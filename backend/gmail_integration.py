@@ -97,6 +97,19 @@ class ComposeRequest(BaseModel):
     body: str = Field(min_length=1, max_length=50000)
 
 
+class UnlockBody(BaseModel):
+    password: str = Field(min_length=1, max_length=1000)
+
+
+class LabelsRequest(BaseModel):
+    add_labels: list[str] = Field(default_factory=list)
+    remove_labels: list[str] = Field(default_factory=list)
+
+
+class ReplyRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=50000)
+
+
 class GmailConnector:
     def __init__(self, token_path: Path):
         self.path = Path(token_path)
@@ -448,9 +461,6 @@ def make_router(service: GmailConnector) -> APIRouter:
                     "connected": False, "email": "", "send_requires_approval": True}
         return {**result, "locked": False}
 
-    class UnlockBody(BaseModel):
-        password: str = Field(min_length=1, max_length=1000)
-
     @router.post("/unlock")
     async def unlock(request: Request, body: UnlockBody):
         guard_local(request)
@@ -511,10 +521,6 @@ def make_router(service: GmailConnector) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
-    class LabelsRequest(BaseModel):
-        add_labels: list[str] = Field(default_factory=list)
-        remove_labels: list[str] = Field(default_factory=list)
-
     @router.post("/messages/{message_id}/labels")
     async def modify_labels(request: Request, message_id: str, body: LabelsRequest):
         require_owner(request)
@@ -530,9 +536,6 @@ def make_router(service: GmailConnector) -> APIRouter:
             return await service.create_gmail_draft(body.to, body.subject, body.body)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-
-    class ReplyRequest(BaseModel):
-        body: str = Field(min_length=1, max_length=50000)
 
     @router.post("/messages/{message_id}/reply")
     async def reply(request: Request, message_id: str, body: ReplyRequest):
