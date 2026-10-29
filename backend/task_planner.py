@@ -368,6 +368,11 @@ To finish the session (ONLY when ALL tasks are marked complete or skipped):
 {"thought":"...","action":"done","summary":"..."}
 
 ACTION REFERENCE:
+- gmail_list_labels → {"action":"gmail_list_labels"}
+- gmail_modify_labels → {"action":"gmail_modify_labels","message_id":"Gmail ID","add_labels":["STARRED"],"remove_labels":["UNREAD"]}
+- gmail_create_draft → {"action":"gmail_create_draft","to":"person@example.com","subject":"Hello","body":"Draft body"}
+- gmail_queue_reply → {"action":"gmail_queue_reply","message_id":"Gmail ID","body":"Reply body"}
+- gmail_send → {"action":"gmail_send","to":"person@example.com","subject":"Hello","body":"Message body"} (QUEUES for approval, NEVER sends directly)
 - gmail_search → {"action":"gmail_search","query":"from:sender@example.com newer_than:7d","limit":5}
 - gmail_read → {"action":"gmail_read","message_id":"ID returned by gmail_search"}
 - gmail_queue_send → {"action":"gmail_queue_send","to":"person@example.com","subject":"Hello","body":"Message text"}
