@@ -5,6 +5,7 @@ Multi-provider AI + structured task planning + rich page extraction
 
 import asyncio, base64, hashlib, json, os, re, shutil, sys, time, traceback
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +38,7 @@ from desktop_automation_portable import (
     select_menu_item_action,
 )
 from page_reader  import extract_page_content, get_capabilities, rank_candidates, format_candidates
+from gmail_integration import GmailConnector, make_router
 from action_protocol import action_to_history_entry, normalize_action_payload
 from agent_sessions import AgentOrchestrator, AgentSessionStore
 from bot_registry import BotRegistry
@@ -95,6 +97,8 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 MEMORY_DIR = os.path.join(BASE_DIR, "memory")
 BOT_SNAPSHOTS_DIR = os.path.join(BASE_DIR, "bot_snapshots")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+gmail_service = GmailConnector(Path(os.path.join(BASE_DIR, "gmail_tokens.json")))
+app.include_router(make_router(gmail_service))
 BOT_REGISTRY_FILE = os.path.join(BASE_DIR, "bots.json")
 for d in (RESULTS_DIR, LOGS_DIR, SESSIONS_DIR, UPLOADS_DIR, MEMORY_DIR, BOT_SNAPSHOTS_DIR): os.makedirs(d, exist_ok=True)
 
@@ -1271,6 +1275,9 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
     act    = action.get("action", "")
     params = {k:v for k,v in action.items()
               if k not in ("action","thought","summary","task_id","finding","reason")}
+    # Do not copy private mail content into condensed action logs.
+    if act in {"gmail_queue_send", "gmail_search", "gmail_read"}:
+        params = {k: ("<redacted>" if k in {"body", "query"} else v) for k, v in params.items()}
     if session_log: session_log.action(act, params)
     try:
         cfg = load_config()
@@ -1307,7 +1314,24 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
                             "desktop_execution_mode=manual. Use manual mode if desired.")
             return None
 
-        if act == "open_application":
+        if act == "gmail_search":
+            data = await gmail_service.search(str(action.get("query", "")), int(action.get("limit", 5)))
+            result = json.dumps(data, ensure_ascii=False)
+
+        elif act == "gmail_read":
+            data = await gmail_service.read(str(action.get("message_id", "")))
+            result = json.dumps(data, ensure_ascii=False)
+
+        elif act == "gmail_queue_send":
+            draft = gmail_service.draft(
+                str(action.get("to", "")),
+                str(action.get("subject", "")),
+                str(action.get("body", "")),
+            )
+            result = ("Email queued for user approval in Settings > Gmail. "
+                      "Not sent. Draft ID: " + draft["id"])
+
+        elif act == "open_application":
             blocked = _desktop_policy(interactive=True)
             command = action.get("command", "")
             cwd = action.get("cwd", "")
