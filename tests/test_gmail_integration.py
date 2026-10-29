@@ -9,10 +9,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
-from fastapi import HTTPException
+from fastapi import HTTPException, FastAPI
+from fastapi.testclient import TestClient
+import httpx
 from cryptography.fernet import Fernet
 from gmail_integration import (
-    GmailConnector, decode_body, guard_local, message_summary, valid_address,
+    GmailConnector, decode_body, guard_local, message_summary, valid_address, make_router, SCOPES,
 )
 
 
@@ -160,6 +162,59 @@ class GmailConnectorTests(unittest.TestCase):
             guard_local(FakeRequest("192.168.1.3", "http://localhost:3000"))
         with self.assertRaises(HTTPException):
             guard_local(FakeRequest("127.0.0.1", "https://evil.example"))
+
+
+    def test_routes_require_owner_and_unlock_cookie(self):
+        app = FastAPI()
+        app.include_router(make_router(self.gmail))
+        headers = {"Origin": "http://localhost:3000"}
+        with TestClient(app, base_url="http://localhost:8765",
+                        client=("127.0.0.1", 50000)) as client:
+            locked = client.get("/gmail/status", headers=headers)
+            self.assertEqual(locked.status_code, 200)
+            self.assertTrue(locked.json()["locked"])
+            self.assertEqual(client.get("/gmail/drafts", headers=headers).status_code, 401)
+            bad = client.post("/gmail/unlock", headers=headers, json={"password": "wrong"})
+            self.assertEqual(bad.status_code, 401)
+            ok = client.post("/gmail/unlock", headers=headers,
+                             json={"password": "test-strong-passphrase-only"})
+            self.assertEqual(ok.status_code, 200)
+            self.assertTrue(ok.json()["unlocked"])
+            self.assertFalse(client.get("/gmail/status", headers=headers).json()["locked"])
+            self.assertEqual(client.get("/gmail/drafts", headers=headers).json(), {"drafts": []})
+            self.assertEqual(client.post("/gmail/unlock",
+                                         headers={"Origin": "http://evil.example"},
+                                         json={"password": "test-strong-passphrase-only"}).status_code, 403)
+
+    def test_oauth_exchange_mocked_with_no_external_requests(self):
+        self.assertEqual(len(SCOPES), 1)
+        url = self.gmail.start_auth()
+        self.assertIn("state=", url)
+        state = next(iter(self.gmail.pending_auth))
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            if str(request.url) == "https://oauth2.googleapis.com/token":
+                return httpx.Response(200, json={
+                    "access_token": "fake-test-access-token",
+                    "refresh_token": "fake-test-refresh-token",
+                    "scope": " ".join(SCOPES),
+                    "expires_in": 3600,
+                })
+            if str(request.url).endswith("/gmail/v1/users/me/profile"):
+                return httpx.Response(200, json={"emailAddress": "verified@gmail.com"})
+            return httpx.Response(404)
+
+        def fake_client(*args, **kwargs):
+            return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch("gmail_integration.httpx.AsyncClient", side_effect=fake_client):
+            account = asyncio.run(self.gmail.finish_auth(state, "fake-google-code"))
+        self.assertEqual(account["email"], "verified@gmail.com")
+        self.assertEqual(self.gmail.status()["email"], "verified@gmail.com")
+        self.assertNotIn(b"fake-test-refresh-token", self.gmail.path.read_bytes())
+        with self.assertRaises(HTTPException):
+            asyncio.run(self.gmail.finish_auth(state, "fake-google-code"))
 
 
 if __name__ == "__main__":
