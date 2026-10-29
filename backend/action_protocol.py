@@ -16,6 +16,11 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 ActionName = Literal[
+    "gmail_list_labels",
+    "gmail_modify_labels",
+    "gmail_create_draft",
+    "gmail_queue_reply",
+    "gmail_send",
     "gmail_search",
     "gmail_read",
     "gmail_queue_send",
@@ -87,6 +92,11 @@ ActionName = Literal[
 ]
 
 ACTION_NAMES: set[str] = {
+    "gmail_list_labels",
+    "gmail_modify_labels",
+    "gmail_create_draft",
+    "gmail_queue_reply",
+    "gmail_send",
     "gmail_search",
     "gmail_read",
     "gmail_queue_send",
