@@ -334,9 +334,12 @@ duplicate sends. If the network fails ambiguously, inspect Gmail's Sent
 folder before retrying. Queued replies preserve Gmail thread references.
 Connection and drafts can be reviewed or removed in Settings.
 
-The model is offered Gmail tools only when a connected account exists and the
-original user goal mentions Gmail or email. Mutating actions additionally
-require an explicit writing/sending or mailbox-management request.
+The model is offered Gmail tools only when a connected account exists, the
+owner has unlocked Gmail before starting the agent task, and the original user
+goal mentions Gmail or email. Mutating actions additionally require an explicit
+writing/sending or mailbox-management request. Generic manual-action APIs
+cannot invoke Gmail tools. Gmail tasks interrupted by a backend restart
+require a new owner-authorized start rather than automatic resumption.
 
 ### Security and deployment model
 
