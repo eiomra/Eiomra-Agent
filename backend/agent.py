@@ -89,8 +89,21 @@ from task_planner import (
 )
 
 app = FastAPI(title="AI Browser Agent")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+# Local workspace: refuse arbitrary browser origins instead of wildcard CORS.
+TRUSTED_BROWSER_ORIGINS = {
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:8765", "http://127.0.0.1:8765",
+}
+app.add_middleware(CORSMiddleware, allow_origins=sorted(TRUSTED_BROWSER_ORIGINS),
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def reject_cross_origin_posts(request, call_next):
+    origin = request.headers.get("origin")
+    if origin and origin not in TRUSTED_BROWSER_ORIGINS:
+        return __import__("fastapi").responses.JSONResponse(
+            {"detail": "Untrusted browser origin."}, status_code=403)
+    return await call_next(request)
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 WORKSPACE_ROOT = os.path.dirname(BASE_DIR)
@@ -1301,6 +1314,12 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
             goal = str(getattr(globals().get("current_tracker"), "goal", "") or "")
             if not re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal):
                 return "Gmail tool blocked: the original user goal did not authorize email access."
+            if act in {"gmail_send", "gmail_queue_send", "gmail_queue_reply", "gmail_create_draft"}:
+                if not re.search(r"(?i)\b(send|compose|draft|write|reply|respond|answer)\b", goal):
+                    return "Gmail compose blocked: the user did not ask to write or send email."
+            if act == "gmail_modify_labels":
+                if not re.search(r"(?i)\b(mark|archive|organize|label|star|move|sort|categorize)\b", goal):
+                    return "Gmail mailbox modification blocked: the user did not request mailbox changes."
 
         def _resolve_upload_paths(single_path: str = "", multiple_paths: list[str] | None = None) -> list[str]:
             if not cfg.get("local_file_access_enabled", True):
@@ -4346,6 +4365,9 @@ async def get_tasks(bot_id: str = "primary"):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    if ws.headers.get("origin") not in TRUSTED_BROWSER_ORIGINS:
+        await ws.close(code=1008, reason="Untrusted browser origin")
+        return
     await ws.accept()
     if ws not in active_ws: active_ws.append(ws)
     try:
@@ -4364,7 +4386,7 @@ async def ws_endpoint(ws: WebSocket):
         if ws in active_ws: active_ws.remove(ws)
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     try:
         port = int(os.environ.get("PORT", "8765"))
     except ValueError:
