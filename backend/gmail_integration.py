@@ -85,6 +85,7 @@ def message_summary(message: dict) -> dict:
         "from": headers.get("from", ""),
         "to": headers.get("to", ""),
         "subject": headers.get("subject", ""),
+        "message_id_header": headers.get("message-id", ""),
         "date": headers.get("date", ""),
         "snippet": message.get("snippet", "")[:400],
     }
@@ -354,6 +355,66 @@ class GmailConnector:
             raise ValueError("Send failed or outcome unknown. Check Gmail Sent before retrying.")
         return {"id": result.get("id"), "thread_id": result.get("threadId"), "sent": True}
 
+
+    async def list_labels(self) -> dict:
+        raw = await self.request_api("GET", "/labels")
+        return {"labels": [
+            {"id": item.get("id"), "name": item.get("name"),
+             "type": item.get("type")}
+            for item in raw.get("labels", [])[:200]
+        ]}
+
+    async def modify_labels(self, message_id: str, add_labels=None, remove_labels=None) -> dict:
+        if not MESSAGE_ID.fullmatch(message_id):
+            raise ValueError("Invalid Gmail message ID.")
+        add_labels = list(add_labels or [])
+        remove_labels = list(remove_labels or [])
+        if not add_labels and not remove_labels:
+            raise ValueError("Specify labels to add or remove.")
+        if len(add_labels) + len(remove_labels) > 20:
+            raise ValueError("Too many labels.")
+        for item in add_labels + remove_labels:
+            if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", item):
+                raise ValueError("Invalid Gmail label ID.")
+        raw = await self.request_api(
+            "POST", "/messages/" + message_id + "/modify",
+            json_data={"addLabelIds": add_labels, "removeLabelIds": remove_labels},
+        )
+        return {"id": raw.get("id", message_id), "label_ids": raw.get("labelIds", [])}
+
+    async def create_gmail_draft(self, to: str, subject: str, body: str) -> dict:
+        addr = valid_address(to)
+        if not subject.strip() or not body.strip() or len(subject) > 500 or len(body) > 50000:
+            raise ValueError("Email subject and body must be nonempty and within limits.")
+        if "\r" in subject or "\n" in subject:
+            raise ValueError("Invalid email subject.")
+        msg = EmailMessage()
+        msg["To"] = addr
+        msg["Subject"] = subject
+        msg.set_content(body)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode().rstrip("=")
+        result = await self.request_api("POST", "/drafts", json_data={"message": {"raw": raw}})
+        return {"draft_id": result.get("id", ""), "saved": True}
+
+    async def queue_reply(self, message_id: str, body: str) -> dict:
+        original = await self.read(message_id)
+        # Reply to the sender; do not use the original To field.
+        from_addr = parseaddr(original.get("from", ""))[1]
+        if not from_addr:
+            raise ValueError("Original message has no valid sender address.")
+        subject = original.get("subject") or "(No subject)"
+        if not subject.lower().startswith("re:"):
+            subject = "Re: " + subject
+        draft = self.draft(from_addr, subject, body)
+        draft["thread_id"] = original.get("thread_id", "")
+        header = original.get("message_id_header", "")
+        if header and "\r" not in header and "\n" not in header:
+            draft["in_reply_to"] = header
+        self.pending_drafts[draft["id"]] = draft
+        self._save_pending()
+        return {"draft_id": draft["id"], "to": draft["to"], "subject": draft["subject"],
+                "queued": True, "requires_approval": True}
+
     async def disconnect(self):
         tokens = self.load_tokens()
         self.path.unlink(missing_ok=True)
@@ -373,19 +434,44 @@ class GmailConnector:
 def make_router(service: GmailConnector) -> APIRouter:
     router = APIRouter(prefix="/gmail", tags=["gmail"])
 
+    def require_owner(request: Request):
+        guard_local(request)
+        if not service.authenticated(request):
+            raise HTTPException(401, "Unlock Gmail in Settings before using this feature.")
+
     @router.get("/status")
     async def status(request: Request):
         guard_local(request)
-        return service.status()
+        result = service.status()
+        if not service.authenticated(request):
+            return {"configured": result["configured"], "locked": True,
+                    "connected": False, "email": "", "send_requires_approval": True}
+        return {**result, "locked": False}
+
+    class UnlockBody(BaseModel):
+        password: str = Field(min_length=1, max_length=1000)
+
+    @router.post("/unlock")
+    async def unlock(request: Request, body: UnlockBody):
+        guard_local(request)
+        try:
+            session_id = service.login(body.password)
+        except ValueError as exc:
+            raise HTTPException(401, str(exc)) from exc
+        response = __import__("fastapi").responses.JSONResponse({"unlocked": True})
+        response.set_cookie("eiomra_gmail_owner", session_id, httponly=True,
+                            secure=service.redirect_uri.startswith("https://"),
+                            samesite="lax", max_age=43200, path="/gmail")
+        return response
 
     @router.get("/oauth/start")
     async def oauth_start(request: Request):
-        guard_local(request)
+        require_owner(request)
         return RedirectResponse(service.start_auth(), status_code=302)
 
     @router.get("/oauth/callback")
     async def oauth_callback(request: Request, state: str = "", code: str = "", error: str = ""):
-        guard_local(request)
+        require_owner(request)
         if error:
             # Never persist or display an OAuth code.
             return HTMLResponse("<h3>Gmail connection was cancelled.</h3>", status_code=400)
@@ -397,13 +483,13 @@ def make_router(service: GmailConnector) -> APIRouter:
 
     @router.post("/disconnect")
     async def disconnect(request: Request):
-        guard_local(request)
+        require_owner(request)
         await service.disconnect()
         return {"connected": False}
 
     @router.get("/messages")
     async def search(request: Request, q: str = "", limit: int = 5):
-        guard_local(request)
+        require_owner(request)
         try:
             return await service.search(q, limit)
         except ValueError as exc:
@@ -411,20 +497,59 @@ def make_router(service: GmailConnector) -> APIRouter:
 
     @router.get("/messages/{message_id}")
     async def read(request: Request, message_id: str):
-        guard_local(request)
+        require_owner(request)
         try:
             return await service.read(message_id)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @router.get("/labels")
+    async def labels(request: Request):
+        require_owner(request)
+        try:
+            return await service.list_labels()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    class LabelsRequest(BaseModel):
+        add_labels: list[str] = Field(default_factory=list)
+        remove_labels: list[str] = Field(default_factory=list)
+
+    @router.post("/messages/{message_id}/labels")
+    async def modify_labels(request: Request, message_id: str, body: LabelsRequest):
+        require_owner(request)
+        try:
+            return await service.modify_labels(message_id, body.add_labels, body.remove_labels)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/gmail-drafts")
+    async def save_gmail_draft(request: Request, body: ComposeRequest):
+        require_owner(request)
+        try:
+            return await service.create_gmail_draft(body.to, body.subject, body.body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    class ReplyRequest(BaseModel):
+        body: str = Field(min_length=1, max_length=50000)
+
+    @router.post("/messages/{message_id}/reply")
+    async def reply(request: Request, message_id: str, body: ReplyRequest):
+        require_owner(request)
+        try:
+            return await service.queue_reply(message_id, body.body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     @router.get("/drafts")
     async def drafts(request: Request):
-        guard_local(request)
+        require_owner(request)
         return {"drafts": service.drafts()}
 
     @router.post("/drafts")
     async def create_draft(request: Request, body: ComposeRequest):
-        guard_local(request)
+        require_owner(request)
         try:
             return service.draft(body.to, body.subject, body.body)
         except ValueError as exc:
@@ -432,7 +557,7 @@ def make_router(service: GmailConnector) -> APIRouter:
 
     @router.post("/drafts/{draft_id}/approve")
     async def approve(request: Request, draft_id: str):
-        guard_local(request)
+        require_owner(request)
         try:
             return await service.approve_send(draft_id)
         except ValueError as exc:
@@ -440,7 +565,10 @@ def make_router(service: GmailConnector) -> APIRouter:
 
     @router.delete("/drafts/{draft_id}")
     async def discard(request: Request, draft_id: str):
-        guard_local(request)
-        return {"discarded": service.pending_drafts.pop(draft_id, None) is not None}
+        require_owner(request)
+        found = service.pending_drafts.pop(draft_id, None) is not None
+        if found:
+            service._save_pending()
+        return {"discarded": found}
 
     return router
