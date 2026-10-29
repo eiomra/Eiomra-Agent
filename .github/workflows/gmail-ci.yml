@@ -25,7 +25,7 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q backend tests
       - name: Run Gmail unit tests
-        run: python -m unittest discover -s tests -p 'test_gmail_integration.py' -v
+        run: python -m unittest discover -s tests -p 'test_gmail*.py' -v
 
   frontend-build:
     runs-on: ubuntu-latest
