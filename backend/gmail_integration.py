@@ -117,6 +117,7 @@ class GmailConnector:
         self.pending_drafts: dict[str, dict] = {}
         self._refresh_lock = asyncio.Lock()
         self._owner_sessions: dict[str, float] = {}
+        self.agent_allowed = False
         self.pending_path = self.path.with_name("gmail_pending.enc")
         self._load_pending()
 
@@ -459,6 +460,7 @@ class GmailConnector:
         self.pending_drafts.clear()
         self.pending_auth.clear()
         self._owner_sessions.clear()
+        self.agent_allowed = False
         token = tokens.get("refresh_token") or tokens.get("access_token")
         if token:
             try:
@@ -495,7 +497,7 @@ def make_router(service: GmailConnector) -> APIRouter:
         response = __import__("fastapi").responses.JSONResponse({"unlocked": True})
         response.set_cookie("eiomra_gmail_owner", session_id, httponly=True,
                             secure=service.redirect_uri.startswith("https://"),
-                            samesite="lax", max_age=43200, path="/gmail")
+                            samesite="lax", max_age=43200, path="/")
         return response
 
     @router.get("/oauth/start")
