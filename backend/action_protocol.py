@@ -16,6 +16,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 ActionName = Literal[
+    "gmail_search",
+    "gmail_read",
+    "gmail_queue_send",
     "navigate",
     "click",
     "click_text",
@@ -84,6 +87,9 @@ ActionName = Literal[
 ]
 
 ACTION_NAMES: set[str] = {
+    "gmail_search",
+    "gmail_read",
+    "gmail_queue_send",
     "navigate",
     "click",
     "click_text",
@@ -362,6 +368,10 @@ def action_to_history_entry(action: dict[str, Any]) -> str:
         key: value for key, value in action.items()
         if key not in {"action", "thought", "summary"} and value not in ("", None, [], {})
     }
+    if name.startswith("gmail_"):
+        for field in ("body", "query"):
+            if field in details and isinstance(details[field], str):
+                details[field] = f"<{len(details[field])} chars hidden>"
     if "content" in details and isinstance(details["content"], str):
         details["content"] = f"<{len(details['content'])} chars>"
     if "old_text" in details and isinstance(details["old_text"], str):
