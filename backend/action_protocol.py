@@ -231,23 +231,45 @@ def _clean_raw_response(raw: str) -> str:
 
 
 def _extract_first_balanced_json_object(text: str) -> dict[str, Any] | None:
+    """Find the first JSON object without counting braces inside strings."""
     depth = 0
     start = None
+    in_string = False
+    escaped = False
+
     for index, char in enumerate(text):
-        if char == "{":
-            if depth == 0:
+        if start is None:
+            if char == "{":
                 start = index
+                depth = 1
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
             depth += 1
         elif char == "}":
             depth -= 1
-            if depth == 0 and start is not None:
+            if depth == 0:
                 candidate = text[start : index + 1]
                 try:
                     parsed = json.loads(candidate)
-                except Exception:
-                    continue
-                if isinstance(parsed, dict):
-                    return parsed
+                except (ValueError, TypeError):
+                    pass
+                else:
+                    if isinstance(parsed, dict):
+                        return parsed
+                start = None
+
     return None
 
 
@@ -264,7 +286,9 @@ def normalize_action_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if field in normalized and normalized[field] is None:
             normalized[field] = ""
         elif field in normalized:
-            normalized[field] = str(normalized[field]).strip()
+            # Preserve indentation and newlines in file and patch payloads.
+            value = str(normalized[field])
+            normalized[field] = value if field in {"content", "old_text", "new_text"} else value.strip()
 
     for field in ("append", "full_page", "recursive", "replace_all"):
         if field in normalized:
@@ -364,6 +388,11 @@ def action_to_history_entry(action: dict[str, Any]) -> str:
     }
     if "content" in details and isinstance(details["content"], str):
         details["content"] = f"<{len(details['content'])} chars>"
+    # Typed input may include credentials; omit it from condensed histories.
+    if name in {"type", "type_and_submit", "desktop_type"}:
+        for field in ("text", "value"):
+            if field in details and isinstance(details[field], str):
+                details[field] = f"<{len(details[field])} chars redacted>"
     if "old_text" in details and isinstance(details["old_text"], str):
         details["old_text"] = details["old_text"][:80]
     if "new_text" in details and isinstance(details["new_text"], str):
