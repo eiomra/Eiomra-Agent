@@ -294,5 +294,10 @@ class RepoRetrievalIndex:
 
     def _is_indexable(self, path: Path) -> bool:
         name = path.name
+        # Never index OAuth tokens, credentials or local configuration into LLM prompts.
+        if name in {"gmail_tokens.json", ".env", ".env.local"}:
+            return False
+        if name == "config.json" and path.parent.name == "backend":
+            return False
         suffix = path.suffix.lower()
         return suffix in TEXT_EXTENSIONS or suffix in ATTACHMENT_EXTENSIONS or name in {"Dockerfile", "README", "README.md", "Makefile"}
