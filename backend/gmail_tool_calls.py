@@ -79,7 +79,8 @@ def openai_tools() -> list[dict]:
 def gemini_tools() -> list[dict]:
     """Translate JSON-schema-ish OpenAI declarations to Gemini parameters."""
     def adapt(value: dict) -> dict:
-        converted = dict(value)
+        # Gemini supports a subset of JSON Schema; omit OpenAI-only keys.
+        converted = {k: v for k, v in value.items() if k != "additionalProperties"}
         if "type" in converted:
             converted["type"] = str(converted["type"]).upper()
         if "items" in converted:
