@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: \${{ matrix.python-version }}
+          python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
         run: python -m pip install fastapi httpx pydantic
       - name: Check Python syntax
@@ -39,6 +39,13 @@ jobs:
       - name: Install frontend packages
         working-directory: frontend
         run: npm ci --include=optional
+      - name: Repair missing Linux Rollup optional package if needed
+        working-directory: frontend
+        run: |
+          if [ ! -d node_modules/@rollup/rollup-linux-x64-gnu ]; then
+            ROLLUP_VERSION=$(node -p "require('./node_modules/rollup/package.json').version")
+            npm install --no-save --no-package-lock "@rollup/rollup-linux-x64-gnu@$ROLLUP_VERSION"
+          fi
       - name: Build frontend
         working-directory: frontend
         run: npm run build
