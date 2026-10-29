@@ -1272,7 +1272,7 @@ export default function App(){
           if(msg.auto_restart){
             const ng=msg.restart_goal||goalRef.current;
             setTimeout(()=>{
-              fetch(`${API}/start`,{method:"POST",headers:{"Content-Type":"application/json"},
+              fetch(`${API}/start`,{method:"POST",credentials:"include",headers:{"Content-Type":"application/json"},
                 body:JSON.stringify({
                   goal:ng,provider:provRef.current,model:modRef.current,auto_restart:true,
                   attachments: attachmentsRef.current.map(a=>a.id),
@@ -1305,7 +1305,7 @@ export default function App(){
     if(!goal.trim()){setStartError("Describe a task before starting the agent.");return;}
     setStartError("");
     try{
-      const r=await fetch(`${API}/start`,{method:"POST",headers:{"Content-Type":"application/json"},
+      const r=await fetch(`${API}/start`,{method:"POST",credentials:"include",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
           goal,provider,model,auto_restart:autoRestart,restart_goal:"",
           attachments: attachments.map(a=>a.id),
