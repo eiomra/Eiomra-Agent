@@ -1289,11 +1289,17 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
     params = {k:v for k,v in action.items()
               if k not in ("action","thought","summary","task_id","finding","reason")}
     # Do not copy private mail content into condensed action logs.
-    if act in {"gmail_queue_send", "gmail_search", "gmail_read"}:
+    if act.startswith("gmail_"):
         params = {k: ("<redacted>" if k in {"body", "query"} else v) for k, v in params.items()}
     if session_log: session_log.action(act, params)
     try:
         cfg = load_config()
+        # Tool calls generated from untrusted pages must not obtain Gmail access
+        # unless the user's original goal explicitly requests email work.
+        if act.startswith("gmail_") and not from_manual:
+            goal = str(getattr(globals().get("current_tracker"), "goal", "") or "")
+            if not re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", goal):
+                return "Gmail tool blocked: the original user goal did not authorize email access."
 
         def _resolve_upload_paths(single_path: str = "", multiple_paths: list[str] | None = None) -> list[str]:
             if not cfg.get("local_file_access_enabled", True):
@@ -1335,14 +1341,31 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
             data = await gmail_service.read(str(action.get("message_id", "")))
             result = json.dumps(data, ensure_ascii=False)
 
-        elif act == "gmail_queue_send":
+        elif act == "gmail_list_labels":
+            result = json.dumps(await gmail_service.list_labels(), ensure_ascii=False)
+
+        elif act == "gmail_modify_labels":
+            result = json.dumps(await gmail_service.modify_labels(
+                str(action.get("message_id", "")),
+                action.get("add_labels") or [], action.get("remove_labels") or []), ensure_ascii=False)
+
+        elif act == "gmail_create_draft":
+            result = json.dumps(await gmail_service.create_gmail_draft(
+                str(action.get("to", "")), str(action.get("subject", "")),
+                str(action.get("body", ""))), ensure_ascii=False)
+
+        elif act == "gmail_queue_reply":
+            result = json.dumps(await gmail_service.queue_reply(
+                str(action.get("message_id", "")), str(action.get("body", ""))), ensure_ascii=False)
+
+        elif act in ("gmail_send", "gmail_queue_send"):
             draft = gmail_service.draft(
                 str(action.get("to", "")),
                 str(action.get("subject", "")),
                 str(action.get("body", "")),
             )
-            result = ("Email queued for user approval in Settings > Gmail. "
-                      "Not sent. Draft ID: " + draft["id"])
+            result = ("Gmail message queued for user approval in Settings > Gmail. "
+                      "It was NOT sent. Draft ID: " + draft["id"])
 
         elif act == "open_application":
             blocked = _desktop_policy(interactive=True)
@@ -2246,7 +2269,7 @@ async def execute_action(action: dict, from_manual: bool = False) -> str:
         result = f"Action failed: {e}"
 
     if session_log and act not in ("complete_task","skip_task","done"):
-        session_log.result(result)
+        session_log.result("[Private Gmail result omitted]" if act.startswith("gmail_") else result)
     return result
 
 
@@ -3318,7 +3341,8 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
             "result": result
         })
         executed_actions.append({
-            "decision": dict(decision),
+            "decision": ({k: ("<redacted>" if k in {"body", "query"} else v)
+                          for k, v in decision.items()} if action.startswith("gmail_") else dict(decision)),
             "result": result,
             "task_description": cur_task.description if cur_task else "",
         })
@@ -3331,12 +3355,13 @@ async def run_agent(goal: str, provider: str, model: str, cfg: dict,
                 "press", "scroll", "read_page", "back",
             }:
                 should_remember = False
-            if should_remember:
+            if should_remember and not action.startswith("gmail_"):
                 method_memory.remember_success(goal, cur_task.description, decision, result)
         orchestrator.append_event(task_id, "action_executed", {
             "step": step,
-            "action": decision,
-            "result": result,
+            "action": ({k: ("<redacted>" if k in {"body", "query"} else v)
+                        for k, v in decision.items()} if action.startswith("gmail_") else decision),
+            "result": "[Private Gmail result omitted]" if action.startswith("gmail_") else result,
         })
 
         await asyncio.sleep(0.5)
