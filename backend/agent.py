@@ -684,9 +684,14 @@ async def run_command_streaming_action(request, timeout: int = 120) -> str:
         "timeout": timeout,
     })
 
+    # Keep OAuth credentials, encryption keys and owner passwords out of
+    # subprocess environment (including agent-generated shell commands).
+    safe_env = {key: value for key, value in os.environ.items()
+                if not key.startswith("EIOMRA_GMAIL_")}
     process = await asyncio.create_subprocess_shell(
         request.command,
         cwd=request.resolved_cwd,
+        env=safe_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
