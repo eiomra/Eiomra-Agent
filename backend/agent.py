@@ -3605,6 +3605,7 @@ async def run_agent_guarded(*args, **kwargs):
             orchestrator.set_metadata(current_session_task_id, last_error=error_message)
         bot_registry.update(current_bot_id, status="interrupted")
     finally:
+        gmail_service.agent_allowed = False
         agent_running = False
         current_session_task_id = None
 
@@ -3654,6 +3655,9 @@ async def lifespan(app):
                             if session.status == "running"
                             and session.metadata.get("resume_on_restart") is True
                             and (session.metadata.get("planned_tasks") or session.metadata.get("final_tasks"))), None)
+        if interrupted and re.search(r"(?i)\b(gmail|e-mail|emails?|mailbox|inbox)\b", interrupted.request):
+            print("Gmail task needs owner reauthorization; automatic resume skipped.", flush=True)
+            interrupted = None
         if interrupted:
             meta = interrupted.metadata
             attachment_ids = [item.get("id") for item in meta.get("attachments", [])
