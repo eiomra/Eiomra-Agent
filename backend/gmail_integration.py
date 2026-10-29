@@ -288,15 +288,39 @@ class GmailConnector:
             return data["access_token"]
 
     async def request_api(self, method: str, path: str, *, params=None, json_data=None) -> dict:
+        """Call the Gmail API. Retry only safe reads and unauthorized requests.
+
+        POST/PUT operations are not retried after ambiguous failures, because a
+        transport exception could occur after the action succeeded on Google.
+        """
         token = await self.access_token()
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.request(method, GMAIL_URL + path, params=params,
-                                            json=json_data,
-                                            headers={"Authorization": "Bearer " + token})
-        if response.status_code >= 400:
-            # Avoid returning Google responses that could echo sensitive values.
-            raise ValueError("Gmail API request failed (HTTP %s)." % response.status_code)
-        return response.json()
+        method = method.upper()
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.request(
+                    method, GMAIL_URL + path, params=params, json=json_data,
+                    headers={"Authorization": "Bearer " + token},
+                )
+            if response.status_code == 401 and attempt == 0:
+                # An expired/revoked access token is rejected before the
+                # mailbox action runs; refresh once and retry.
+                async with self._refresh_lock:
+                    data = self.load_tokens()
+                    data["expires_at"] = 0
+                    self.save_tokens(data)
+                token = await self.access_token()
+                continue
+            if method == "GET" and response.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                retry_after = response.headers.get("Retry-After", "")
+                delay = (min(float(retry_after), 8) if retry_after.isdigit()
+                         else min(2 ** attempt, 8))
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code >= 400:
+                # Never echo Google responses: they can contain private metadata.
+                raise ValueError(f"Gmail API request failed (HTTP {response.status_code}).")
+            return response.json()
+        raise ValueError("Gmail API request failed after retries.")
 
     async def search(self, query: str = "", limit: int = 5) -> dict:
         limit = max(1, min(int(limit), 10))
